@@ -1,0 +1,4 @@
+(library
+ (name apple_perf_stat)
+ (public_name apple-perf-stat)
+ (libraries unix str))
