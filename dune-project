@@ -11,8 +11,8 @@
 
 (package
  (name apple-perf-stat)
- (synopsis "OCaml bindings for Apple Silicon performance counters")
- (description "Access hardware performance counters (PMC) on Apple Silicon Macs. 
+ (synopsis "OCaml bindings for macOS hardware performance counters")
+ (description "Access hardware performance counters (PMC) on macOS (Apple Silicon and Intel).
 Provides IPC, cache misses, TLB misses, branch mispredictions, and more.")
  (depends
   (ocaml (>= 4.14))

@@ -1,5 +1,5 @@
 /*
- * apple-perf-stat: A perf stat-like tool for Apple Silicon
+ * apple-perf-stat: A perf stat-like tool for macOS (Apple Silicon and Intel)
  *
  * Uses PET (Profile Every Thread) for accurate per-process counter totals.
  * Correctly handles multi-threaded programs like OCaml 5.x with multiple
@@ -152,6 +152,8 @@ static int (*kpep_config_kpc)(kpep_config *cfg, kpc_config_t *buf, usize buf_siz
 // kdebug structures and constants
 // ============================================================================
 
+// On both arm64 and x86_64 macOS (LP64), kd_buf args are 64-bit.
+// The arm64 headers use uint64_t; x86_64 headers use uintptr_t (same size).
 #if defined(__arm64__)
 typedef uint64_t kd_buf_argtype;
 #else
@@ -328,15 +330,26 @@ typedef struct {
 } event_alias_t;
 
 static const event_alias_t builtin_aliases[] = {
-    { "cycles", { "FIXED_CYCLES", "CPU_CLK_UNHALTED.THREAD", NULL }},
+    // Core counters (Apple Silicon names first, then Intel)
+    { "cycles", { "FIXED_CYCLES", "CPU_CLK_UNHALTED.THREAD", "CPU_CLK_UNHALTED.CORE", NULL }},
     { "instructions", { "FIXED_INSTRUCTIONS", "INST_RETIRED.ANY", NULL }},
     { "branches", { "INST_BRANCH", "BR_INST_RETIRED.ALL_BRANCHES", NULL }},
-    { "branch-misses", { "BRANCH_MISPRED_NONSPEC", "BRANCH_MISPREDICT", NULL }},
-    { "l1d-tlb-misses", { "L1D_TLB_MISS", "L1D_TLB_MISS_NONSPEC", NULL }},
-    { "l1i-tlb-misses", { "L1I_TLB_MISS_DEMAND", NULL }},
-    { "l2-tlb-misses-data", { "L2_TLB_MISS_DATA", NULL }},
-    { "l1d-cache-misses", { "L1D_CACHE_MISS_LD", "L1D_CACHE_MISS_LD_NONSPEC", NULL }},
-    { "l1i-cache-misses", { "L1I_CACHE_MISS_DEMAND", NULL }},
+    { "branch-misses", { "BRANCH_MISPRED_NONSPEC", "BRANCH_MISPREDICT", "BR_MISP_RETIRED.ALL_BRANCHES", NULL }},
+
+    // TLB misses
+    { "l1d-tlb-misses", { "L1D_TLB_MISS", "L1D_TLB_MISS_NONSPEC", "DTLB_LOAD_MISSES.MISS_CAUSES_A_WALK", NULL }},
+    { "l1i-tlb-misses", { "L1I_TLB_MISS_DEMAND", "ITLB_MISSES.MISS_CAUSES_A_WALK", NULL }},
+    { "l2-tlb-misses-data", { "L2_TLB_MISS_DATA", "DTLB_LOAD_MISSES.WALK_COMPLETED", NULL }},
+
+    // Cache misses
+    { "l1d-cache-misses", { "L1D_CACHE_MISS_LD", "L1D_CACHE_MISS_LD_NONSPEC", "MEM_LOAD_RETIRED.L1_MISS", "L1D.REPLACEMENT", NULL }},
+    { "l1i-cache-misses", { "L1I_CACHE_MISS_DEMAND", "ICACHE.MISSES", NULL }},
+    { "llc-misses", { "L2_CACHE_MISS_DATA", "LONGEST_LAT_CACHE.MISS", "MEM_LOAD_RETIRED.L3_MISS", NULL }},
+
+    // Intel reference cycles (fixed counter, no Apple Silicon equivalent)
+    { "ref-cycles", { "CPU_CLK_UNHALTED.REF_TSC", NULL }},
+
+    // Apple Silicon specific (no Intel equivalents)
     { "map-stalls", { "MAP_STALL", NULL }},
     { "dispatch-stalls", { "MAP_STALL_DISPATCH", NULL }},
     { NULL, { NULL } }
@@ -428,7 +441,10 @@ static bool pmc_add_event(pmc_state_t *state, const char *name) {
 
     u32 err = 0;
     if (kpep_config_add_event(state->config, &ev, 0, &err) != 0) {
+        kpep_db_internal *db_int = (kpep_db_internal *)state->db;
         fprintf(stderr, "Error: Failed to add event '%s' (conflict: 0x%x)\n", name, err);
+        fprintf(stderr, "  This CPU has %zu fixed + %zu configurable counters\n",
+                db_int->fixed_counter_count, db_int->config_counter_count);
         return false;
     }
 
@@ -981,11 +997,12 @@ static void usage(const char *prog) {
         "multi-threaded programs. All threads in the target process are\n"
         "tracked and their counter values aggregated.\n"
         "\n"
-        "Built-in event aliases:\n"
+        "Built-in event aliases (work on both Apple Silicon and Intel):\n"
         "  cycles, instructions, branches, branch-misses\n"
         "  l1d-tlb-misses, l1i-tlb-misses, l2-tlb-misses-data\n"
-        "  l1d-cache-misses, l1i-cache-misses\n"
-        "  map-stalls, dispatch-stalls\n"
+        "  l1d-cache-misses, l1i-cache-misses, llc-misses\n"
+        "  ref-cycles (Intel only)\n"
+        "  map-stalls, dispatch-stalls (Apple Silicon only)\n"
         "\n"
         "Example:\n"
         "  sudo %s -e cycles -e instructions -- ./my_benchmark\n"
@@ -1004,7 +1021,14 @@ static void list_events(void) {
     }
 
     kpep_db_internal *db_int = (kpep_db_internal *)db;
-    printf("PMC Database: %s (%s)\n",
+    const char *arch_name;
+#if defined(__arm64__)
+    arch_name = "Apple Silicon (arm64)";
+#else
+    arch_name = "Intel (x86_64)";
+#endif
+    printf("Architecture:  %s\n", arch_name);
+    printf("PMC Database:  %s (%s)\n",
            db_int->name ? db_int->name : "unknown",
            db_int->marketing_name ? db_int->marketing_name : "");
     printf("Fixed counters: %zu, Configurable: %zu\n\n",

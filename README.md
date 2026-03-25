@@ -1,10 +1,10 @@
 # mperf
 
-mperf - A `perf stat`-like tool for Apple Silicon Macs (M1/M2/M3/M4).
+mperf - A `perf stat`-like tool for macOS (Apple Silicon and Intel).
 
 ## Overview
 
-This tool provides access to Apple Silicon hardware performance counters (PMCs) via a simple CLI interface, similar to Linux's `perf stat`.
+This tool provides access to hardware performance counters (PMCs) on macOS via a simple CLI interface, similar to Linux's `perf stat`. It works on both Apple Silicon (M1/M2/M3/M4) and Intel Macs.
 
 Linux `perf stat` uses exact hardware counting when the number of requested events fits within the CPU's physical PMU counters (typically 4-8 on x86_64, ~7 on ARM64). Beyond that limit, the kernel enables time-division multiplexing and scales the counts — producing estimates, not exact values. mperf's PET approach is fundamentally sampling-based: all requested counters (up to 10) are always physically active, but values are captured via periodic kernel snapshots rather than continuous counting.
 
@@ -143,33 +143,36 @@ let () =
 
 ### Built-in Aliases
 
-These aliases work across different Apple Silicon generations:
+These aliases work across Apple Silicon and Intel:
 
-| Alias                | Description                 |
-|----------------------|-----------------------------|
-| `cycles`             | CPU cycles                  |
-| `instructions`       | Retired instructions        |
-| `branches`           | Branch instructions         |
-| `branch-misses`      | Mispredicted branches       |
-| `l1d-tlb-misses`     | L1 data TLB misses          |
-| `l1i-tlb-misses`     | L1 instruction TLB misses   |
-| `l2-tlb-misses-data` | L2 TLB data misses          |
-| `l1d-cache-misses`   | L1 data cache misses        |
-| `l1i-cache-misses`   | L1 instruction cache misses |
-| `map-stalls`         | Map unit stall cycles       |
-| `dispatch-stalls`    | Dispatch stall cycles       |
+| Alias                | Description                 | Availability |
+|----------------------|-----------------------------|--------------|
+| `cycles`             | CPU cycles                  | Both         |
+| `instructions`       | Retired instructions        | Both         |
+| `branches`           | Branch instructions         | Both         |
+| `branch-misses`      | Mispredicted branches       | Both         |
+| `l1d-tlb-misses`     | L1 data TLB misses          | Both         |
+| `l1i-tlb-misses`     | L1 instruction TLB misses   | Both         |
+| `l2-tlb-misses-data` | L2 TLB data misses          | Both         |
+| `l1d-cache-misses`   | L1 data cache misses        | Both         |
+| `l1i-cache-misses`   | L1 instruction cache misses | Both         |
+| `llc-misses`         | Last-level cache misses     | Both         |
+| `ref-cycles`         | Reference cycles (fixed)    | Intel only   |
+| `map-stalls`         | Map unit stall cycles       | Apple Silicon only |
+| `dispatch-stalls`    | Dispatch stall cycles       | Apple Silicon only |
 
 ### Raw Events
 
-You can also use raw event names from the PMC database. The database files are:
+You can also use raw event names from the PMC database. The database files are at `/usr/share/kpep/`:
 
 | CPU               | Database File               |
 |-------------------|-----------------------------|
-| M1 (all variants) | `/usr/share/kpep/a14.plist` |
-| M2 (all variants) | `/usr/share/kpep/a15.plist` |
-| M3                | `/usr/share/kpep/as1.plist` |
-| M3 Pro/Max        | `/usr/share/kpep/as3.plist` |
-| M4                | `/usr/share/kpep/as4.plist` |
+| M1 (all variants) | `a14.plist`                 |
+| M2 (all variants) | `a15.plist`                 |
+| M3                | `as1.plist`                 |
+| M3 Pro/Max        | `as3.plist`                 |
+| M4                | `as4.plist`                 |
+| Intel             | `cpu_*.plist` (varies by model) |
 
 Run `./mperf-stat -l` to see all events for your CPU.
 
@@ -224,11 +227,14 @@ sudo ./mperf-stat -p 5 -e cycles -e instructions -- ./long_benchmark
 
 ### Counter Limits
 
-Apple Silicon has:
-- 2 fixed counters (cycles, instructions)
-- 8 configurable counters
+The number of hardware counters varies by architecture:
 
-You can measure up to 10 events simultaneously.
+| Architecture  | Fixed Counters | Configurable Counters | Max Events |
+|---------------|----------------|-----------------------|------------|
+| Apple Silicon | 2              | 8                     | 10         |
+| Intel         | 3              | 4-8 (varies by model) | 7-11       |
+
+Run `./mperf-stat -l` to see the counter counts for your CPU.
 
 ### Sampling Accuracy
 
@@ -254,7 +260,7 @@ The tool tracks up to 256 unique threads. For programs with more threads, some d
 | Counting       | Exact when within HW counter limit; scaled estimates when multiplexing | Sampling-based (PET), all counters always active |
 | Root required  | Some events                                | All events                                |
 | Output formats | Text, JSON, CSV                            | Text, JSON                                |
-| HW counters    | 4-8 GP + 3-4 fixed (varies by CPU)        | 8 configurable + 2 fixed (10 total)       |
+| HW counters    | 4-8 GP + 3-4 fixed (varies by CPU)        | Varies: 2-3 fixed + 4-8 configurable      |
 | Multiplexing   | Yes, with time-scaled estimates            | No (hard limit of 10 events)              |
 | Process scope  | Direct measurement                         | PID-filtered kernel sampling              |
 | Event naming   | Standardised                               | Apple-specific + portable aliases         |
@@ -275,4 +281,4 @@ MIT
 
 TODO
 
- - [ ] Port to x86_64 macOS versions, there should be similar PMC counters available.
+ - [x] Port to x86_64 macOS versions, there should be similar PMC counters available.
