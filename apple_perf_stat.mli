@@ -1,15 +1,15 @@
-(** Apple Performance Counters interface for macOS/Apple Silicon
+(** Apple Performance Counters interface for macOS
 
     This module provides a wrapper around the apple-perf-stat CLI tool,
     giving OCaml programs access to hardware performance counters on
-    Apple Silicon Macs.
+    macOS (Apple Silicon and Intel).
 
     The tool uses PET (Profile Every Thread) to accurately measure
     multi-threaded programs, including OCaml 5.x programs with multiple
     domains.
 
     {b Requirements:}
-    - macOS with Apple Silicon (M1/M2/M3/M4)
+    - macOS (Apple Silicon or Intel)
     - The apple-perf-stat binary installed
     - Root privileges (sudo)
 
@@ -115,7 +115,7 @@ val string_of_error : error -> string
 
     {2 Built-in Aliases}
 
-    These work across different Apple Silicon generations:
+    These work across Apple Silicon and Intel:
 
     - [cycles] - CPU cycles
     - [instructions] - Retired instructions
@@ -126,8 +126,10 @@ val string_of_error : error -> string
     - [l2-tlb-misses-data] - L2 TLB misses (data)
     - [l1d-cache-misses] - L1 data cache misses
     - [l1i-cache-misses] - L1 instruction cache misses
-    - [map-stalls] - Map unit stall cycles
-    - [dispatch-stalls] - Dispatch stall cycles
+    - [llc-misses] - Last-level cache misses
+    - [ref-cycles] - Reference cycles (Intel only)
+    - [map-stalls] - Map unit stall cycles (Apple Silicon only)
+    - [dispatch-stalls] - Dispatch stall cycles (Apple Silicon only)
 
     {2 Raw Event Names}
 
@@ -135,11 +137,8 @@ val string_of_error : error -> string
     Run [apple-perf-stat --list] to see all available events
     for your specific CPU.
 
-    The event database files are located at:
-    - M1: [/usr/share/kpep/a14.plist]
-    - M2: [/usr/share/kpep/a15.plist]
-    - M3: [/usr/share/kpep/as1.plist] or [as3.plist]
-    - M4: [/usr/share/kpep/as4.plist]
+    The event database files are located at [/usr/share/kpep/].
+    Run [mperf-stat --list] to see all events for your CPU.
 
     {1:threading Threading Model}
 

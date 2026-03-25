@@ -8,8 +8,15 @@ on:
 
 jobs:
   build:
-    name: macOS ARM64
-    runs-on: macos-15
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-13
+            arch: x86_64
 
     steps:
       - name: Checkout code
