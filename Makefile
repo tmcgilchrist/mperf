@@ -15,12 +15,22 @@ endif
 TARGET = mperf-stat
 SRC = apple_perf_stat.c
 
-.PHONY: all clean
+PREFIX ?= /usr/local
+BINDIR = $(PREFIX)/bin
+
+.PHONY: all clean install uninstall
 
 all: $(TARGET)
 
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $<
+
+install: $(TARGET)
+	install -d $(BINDIR)
+	install -m 755 $(TARGET) $(BINDIR)
+
+uninstall:
+	rm -f $(BINDIR)/$(TARGET)
 
 clean:
 	rm -f $(TARGET)
