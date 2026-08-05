@@ -181,7 +181,7 @@ let run ?(events = ["cycles"; "instructions"]) ?(sample_period_ms = 1.0) command
       |> List.map (fun e -> ["-e"; e]) 
       |> List.flatten 
     in
-    let period_args = ["-p"; Printf.sprintf "%.1f" sample_period_ms] in
+    let period_args = ["-P"; Printf.sprintf "%.1f" sample_period_ms] in
     let args = 
       [!tool_path] @ ["-j"] @ period_args @ event_args @ ["--"] @ command
       |> Array.of_list

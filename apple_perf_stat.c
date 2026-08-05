@@ -988,10 +988,13 @@ static void usage(const char *prog) {
         "Options:\n"
         "  -e, --event EVENT    Add event to measure (can repeat, max 10)\n"
         "  -j, --json           Output in JSON format\n"
-        "  -p, --period MS      Sampling period in milliseconds (default: 1)\n"
+        "  -P, --period MS      PET sampling period in milliseconds (default: 1)\n"
         "  -v, --verbose        Verbose output\n"
         "  -l, --list           List available events\n"
         "  -h, --help           Show this help\n"
+        "\n"
+        "Reserved to match perf stat, not supported yet:\n"
+        "  -p, --pid PID        Attach to an already-running process\n"
         "\n"
         "This tool uses PET (Profile Every Thread) to accurately measure\n"
         "multi-threaded programs. All threads in the target process are\n"
@@ -1066,10 +1069,13 @@ static void list_events(void) {
 }
 
 int main(int argc, char **argv) {
+    // Short flags follow perf stat where an equivalent exists. In particular
+    // -p is perf's --pid, so the PET sampling period lives on -P/--period.
     static struct option long_opts[] = {
         {"event",   required_argument, 0, 'e'},
         {"json",    no_argument,       0, 'j'},
-        {"period",  required_argument, 0, 'p'},
+        {"period",  required_argument, 0, 'P'},
+        {"pid",     required_argument, 0, 'p'},
         {"verbose", no_argument,       0, 'v'},
         {"list",    no_argument,       0, 'l'},
         {"help",    no_argument,       0, 'h'},
@@ -1083,7 +1089,7 @@ int main(int argc, char **argv) {
     bool verbose = false;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "e:jp:vlh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "e:jP:p:vlh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'e':
                 if (event_count >= MAX_EVENTS) {
@@ -1095,13 +1101,19 @@ int main(int argc, char **argv) {
             case 'j':
                 format = OUTPUT_JSON;
                 break;
-            case 'p':
+            case 'P':
                 sample_period_ms = atof(optarg);
                 if (sample_period_ms <= 0) {
                     fprintf(stderr, "Invalid sample period\n");
                     return 1;
                 }
                 break;
+            case 'p':
+                fprintf(stderr,
+                    "Error: -p/--pid (attach to an already-running process) "
+                    "is not supported yet.\n"
+                    "       To set the PET sampling period, use -P/--period MS.\n");
+                return 1;
             case 'v':
                 verbose = true;
                 break;

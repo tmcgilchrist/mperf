@@ -203,10 +203,10 @@ Result = Σ (thread_last - thread_first) for all threads
 sudo ./mperf-stat -e cycles -e instructions -- ./benchmark
 
 # Faster sampling (0.5ms) - more accurate for short-lived threads
-sudo ./mperf-stat -p 0.5 -e cycles -e instructions -- ./short_benchmark
+sudo ./mperf-stat -P 0.5 -e cycles -e instructions -- ./short_benchmark
 
 # Slower sampling (5ms) - less overhead for long-running programs
-sudo ./mperf-stat -p 5 -e cycles -e instructions -- ./long_benchmark
+sudo ./mperf-stat -P 5 -e cycles -e instructions -- ./long_benchmark
 ```
 
 - **Faster sampling:** More accurate (catches short-lived threads) but higher overhead
