@@ -260,6 +260,7 @@ The tool tracks up to 256 unique threads. For programs with more threads, some d
 | Counting       | Exact when within HW counter limit; scaled estimates when multiplexing | Sampling-based (PET), all counters always active |
 | Root required  | Some events                                | All events                                |
 | Output formats | Text, JSON, CSV                            | Text, JSON                                |
+| Report stream  | stderr; `-o`, `--append`, `--log-fd`       | Same                                      |
 | HW counters    | 4-8 GP + 3-4 fixed (varies by CPU)        | Varies: 2-3 fixed + 4-8 configurable      |
 | Multiplexing   | Yes, with time-scaled estimates            | No (hard limit of 10 events)              |
 | Process scope  | Direct measurement                         | PID-filtered kernel sampling              |

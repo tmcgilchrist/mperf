@@ -907,13 +907,13 @@ typedef enum {
     OUTPUT_JSON
 } output_format_t;
 
-static void output_text(pmc_state_t *state) {
-    printf("\n Performance counter stats");
+static void output_text(pmc_state_t *state, FILE *out) {
+    fprintf(out, "\n Performance counter stats");
     if (state->num_threads_seen > 0) {
-        printf(" (%d thread%s)", state->num_threads_seen,
-               state->num_threads_seen == 1 ? "" : "s");
+        fprintf(out, " (%d thread%s)", state->num_threads_seen,
+                state->num_threads_seen == 1 ? "" : "s");
     }
-    printf(":\n\n");
+    fprintf(out, ":\n\n");
 
     u64 cycles = 0, instructions = 0;
     for (int i = 0; i < state->event_count; i++) {
@@ -925,40 +925,40 @@ static void output_text(pmc_state_t *state) {
 
     for (int i = 0; i < state->event_count; i++) {
         configured_event_t *e = &state->events[i];
-        printf("  %'20llu  %-24s", (unsigned long long)e->value, e->name);
+        fprintf(out, "  %'20llu  %-24s", (unsigned long long)e->value, e->name);
         if (strcasecmp(e->name, "instructions") == 0 && cycles > 0) {
-            printf("  # %6.2f IPC", (double)instructions / cycles);
+            fprintf(out, "  # %6.2f IPC", (double)instructions / cycles);
         }
-        printf("\n");
+        fprintf(out, "\n");
     }
 
-    printf("\n");
-    printf("  %'14.6f seconds wall time\n", state->wall_time_ns / 1e9);
-    printf("  %'14.6f seconds user\n", state->user_time_ns / 1e9);
-    printf("  %'14.6f seconds sys\n", state->sys_time_ns / 1e9);
-    printf("\n");
+    fprintf(out, "\n");
+    fprintf(out, "  %'14.6f seconds wall time\n", state->wall_time_ns / 1e9);
+    fprintf(out, "  %'14.6f seconds user\n", state->user_time_ns / 1e9);
+    fprintf(out, "  %'14.6f seconds sys\n", state->sys_time_ns / 1e9);
+    fprintf(out, "\n");
 }
 
-static void output_json(pmc_state_t *state) {
-    printf("{\n");
-    printf("  \"counters\": {\n");
+static void output_json(pmc_state_t *state, FILE *out) {
+    fprintf(out, "{\n");
+    fprintf(out, "  \"counters\": {\n");
 
     for (int i = 0; i < state->event_count; i++) {
         configured_event_t *e = &state->events[i];
-        printf("    \"%s\": %llu%s\n",
-               e->name,
-               (unsigned long long)e->value,
-               i < state->event_count - 1 ? "," : "");
+        fprintf(out, "    \"%s\": %llu%s\n",
+                e->name,
+                (unsigned long long)e->value,
+                i < state->event_count - 1 ? "," : "");
     }
 
-    printf("  },\n");
-    printf("  \"time\": {\n");
-    printf("    \"wall_ns\": %.0f,\n", state->wall_time_ns);
-    printf("    \"user_ns\": %.0f,\n", state->user_time_ns);
-    printf("    \"sys_ns\": %.0f\n", state->sys_time_ns);
-    printf("  },\n");
+    fprintf(out, "  },\n");
+    fprintf(out, "  \"time\": {\n");
+    fprintf(out, "    \"wall_ns\": %.0f,\n", state->wall_time_ns);
+    fprintf(out, "    \"user_ns\": %.0f,\n", state->user_time_ns);
+    fprintf(out, "    \"sys_ns\": %.0f\n", state->sys_time_ns);
+    fprintf(out, "  },\n");
 
-    printf("  \"derived\": {\n");
+    fprintf(out, "  \"derived\": {\n");
     u64 cycles = 0, instructions = 0;
     for (int i = 0; i < state->event_count; i++) {
         if (strcasecmp(state->events[i].name, "cycles") == 0)
@@ -968,13 +968,13 @@ static void output_json(pmc_state_t *state) {
     }
 
     if (cycles > 0 && instructions > 0) {
-        printf("    \"ipc\": %.6f,\n", (double)instructions / cycles);
-        printf("    \"cpi\": %.6f\n", (double)cycles / instructions);
+        fprintf(out, "    \"ipc\": %.6f,\n", (double)instructions / cycles);
+        fprintf(out, "    \"cpi\": %.6f\n", (double)cycles / instructions);
     }
-    printf("  },\n");
+    fprintf(out, "  },\n");
 
-    printf("  \"threads_measured\": %d\n", state->num_threads_seen);
-    printf("}\n");
+    fprintf(out, "  \"threads_measured\": %d\n", state->num_threads_seen);
+    fprintf(out, "}\n");
 }
 
 // ============================================================================
@@ -988,10 +988,16 @@ static void usage(const char *prog) {
         "Options:\n"
         "  -e, --event EVENT    Add event to measure (can repeat, max 10)\n"
         "  -j, --json           Output in JSON format\n"
+        "  -o, --output FILE    Write the report to FILE instead of stderr\n"
+        "      --append         Append to the -o file instead of truncating\n"
+        "      --log-fd FD      Write the report to file descriptor FD\n"
         "  -P, --period MS      PET sampling period in milliseconds (default: 1)\n"
         "  -v, --verbose        Verbose output\n"
         "  -l, --list           List available events\n"
         "  -h, --help           Show this help\n"
+        "\n"
+        "The counter report goes to stderr (as perf stat does), so the measured\n"
+        "program keeps sole ownership of stdout.\n"
         "\n"
         "Reserved to match perf stat, not supported yet:\n"
         "  -p, --pid PID        Attach to an already-running process\n"
@@ -1071,9 +1077,14 @@ static void list_events(void) {
 int main(int argc, char **argv) {
     // Short flags follow perf stat where an equivalent exists. In particular
     // -p is perf's --pid, so the PET sampling period lives on -P/--period.
+    enum { OPT_APPEND = 1000, OPT_LOG_FD };
+
     static struct option long_opts[] = {
         {"event",   required_argument, 0, 'e'},
         {"json",    no_argument,       0, 'j'},
+        {"output",  required_argument, 0, 'o'},
+        {"append",  no_argument,       0, OPT_APPEND},
+        {"log-fd",  required_argument, 0, OPT_LOG_FD},
         {"period",  required_argument, 0, 'P'},
         {"pid",     required_argument, 0, 'p'},
         {"verbose", no_argument,       0, 'v'},
@@ -1087,9 +1098,12 @@ int main(int argc, char **argv) {
     output_format_t format = OUTPUT_TEXT;
     double sample_period_ms = 1.0;  // 1ms default
     bool verbose = false;
+    const char *output_name = NULL;
+    int output_fd = -1;
+    bool append = false;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "e:jP:p:vlh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "e:jo:P:p:vlh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'e':
                 if (event_count >= MAX_EVENTS) {
@@ -1100,6 +1114,19 @@ int main(int argc, char **argv) {
                 break;
             case 'j':
                 format = OUTPUT_JSON;
+                break;
+            case 'o':
+                output_name = optarg;
+                break;
+            case OPT_APPEND:
+                append = true;
+                break;
+            case OPT_LOG_FD:
+                output_fd = atoi(optarg);
+                if (output_fd < 0) {
+                    fprintf(stderr, "Invalid --log-fd: %s\n", optarg);
+                    return 1;
+                }
                 break;
             case 'P':
                 sample_period_ms = atof(optarg);
@@ -1131,6 +1158,30 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: No command specified\n");
         usage(argv[0]);
         return 1;
+    }
+
+    if (output_name && output_fd >= 0) {
+        fprintf(stderr, "Error: cannot use both --output and --log-fd\n");
+        return 1;
+    }
+
+    // The report goes to stderr like perf stat, leaving stdout to the measured
+    // program. Resolve any redirection now so a bad path fails before we run it.
+    FILE *out = stderr;
+    if (output_name) {
+        out = fopen(output_name, append ? "a" : "w");
+        if (!out) {
+            fprintf(stderr, "Error: cannot open %s: %s\n",
+                    output_name, strerror(errno));
+            return 1;
+        }
+    } else if (output_fd >= 0) {
+        out = fdopen(output_fd, "w");
+        if (!out) {
+            fprintf(stderr, "Error: cannot use fd %d: %s\n",
+                    output_fd, strerror(errno));
+            return 1;
+        }
     }
 
     // Default events
@@ -1172,10 +1223,12 @@ int main(int argc, char **argv) {
     bool success = run_command_pet(&state, &argv[optind], sample_period_sec, verbose);
 
     if (format == OUTPUT_JSON) {
-        output_json(&state);
+        output_json(&state, out);
     } else {
-        output_text(&state);
+        output_text(&state, out);
     }
+    fflush(out);
+    if (out != stderr) fclose(out);
 
     pmc_cleanup(&state);
     return success ? 0 : 1;

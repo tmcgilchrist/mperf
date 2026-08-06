@@ -182,28 +182,23 @@ let run ?(events = ["cycles"; "instructions"]) ?(sample_period_ms = 1.0) command
       |> List.flatten 
     in
     let period_args = ["-P"; Printf.sprintf "%.1f" sample_period_ms] in
-    let args = 
-      [!tool_path] @ ["-j"] @ period_args @ event_args @ ["--"] @ command
+
+    (* The tool writes its report to stderr, which the measured command also
+       inherits, so ask for it in a file rather than trying to demultiplex.
+       stdin/stdout/stderr are passed through untouched to the command. *)
+    let report_file = Filename.temp_file "mperf" ".json" in
+    Fun.protect ~finally:(fun () -> try Sys.remove report_file with Sys_error _ -> ())
+    @@ fun () ->
+
+    let args =
+      [!tool_path] @ ["-j"] @ ["-o"; report_file] @ period_args @ event_args
+      @ ["--"] @ command
       |> Array.of_list
     in
-    
-    (* Run and capture output *)
-    let (stdout_read, stdout_write) = Unix.pipe () in
-    let pid = Unix.create_process !tool_path args 
-                Unix.stdin stdout_write Unix.stderr in
-    Unix.close stdout_write;
-    
-    (* Read output *)
-    let buffer = Buffer.create 1024 in
-    let bytes = Bytes.create 1024 in
-    let rec read_all () =
-      match Unix.read stdout_read bytes 0 1024 with
-      | 0 -> ()
-      | n -> Buffer.add_subbytes buffer bytes 0 n; read_all ()
-    in
-    read_all ();
-    Unix.close stdout_read;
-    
+
+    let pid = Unix.create_process !tool_path args
+                Unix.stdin Unix.stdout Unix.stderr in
+
     (* Wait for process *)
     let _, status = Unix.waitpid [] pid in
     let exit_code = match status with
@@ -211,9 +206,12 @@ let run ?(events = ["cycles"; "instructions"]) ?(sample_period_ms = 1.0) command
       | Unix.WSIGNALED s -> 128 + s
       | Unix.WSTOPPED s -> 128 + s
     in
-    
-    let output = Buffer.contents buffer in
-    
+
+    let output =
+      try In_channel.with_open_bin report_file In_channel.input_all
+      with Sys_error _ -> ""
+    in
+
     if exit_code <> 0 && String.length output = 0 then
       Error (Command_failed exit_code)
     else
