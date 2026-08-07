@@ -548,8 +548,17 @@ static void profiling_cleanup(void) {
 // PET-based measurement (accurate, multi-threaded)
 // ============================================================================
 
+// How the measured command finished. `reaped` says whether `status` holds a
+// real wait(2) status; it is false when the tool failed before the command
+// could be waited for, and the caller then reports a tool error instead.
+typedef struct {
+    bool reaped;
+    int status;
+} child_outcome_t;
+
 static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
-                         double sample_period_sec, bool verbose, int sync_fd) {
+                         double sample_period_sec, bool verbose, int sync_fd,
+                         child_outcome_t *outcome) {
     bool success = false;
     int ret;
 
@@ -675,6 +684,8 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
         pid_t result = waitpid(target_pid, &status, WNOHANG);
         if (result == -1 && errno != EINTR) break;
         if (result == target_pid) {
+            outcome->reaped = true;
+            outcome->status = status;
             // Child exited, do one more read then stop
             usleep((useconds_t)(sample_period_sec * 1e6));
         }
@@ -828,7 +839,9 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
     state->user_time_ns = user_diff.tv_sec * 1e9 + user_diff.tv_usec * 1e3;
     state->sys_time_ns = sys_diff.tv_sec * 1e9 + sys_diff.tv_usec * 1e3;
 
-    success = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    // Measurement itself succeeded; whether the command did is the caller's
+    // business, and is reported through the exit status rather than folded in.
+    success = outcome->reaped;
 
 cleanup:
     profiling_cleanup();
@@ -840,7 +853,11 @@ fail_early:
     return false;
 }
 
-static bool run_command_pet(pmc_state_t *state, char **argv, double sample_period, bool verbose) {
+static bool run_command_pet(pmc_state_t *state, char **argv, double sample_period,
+                            bool verbose, child_outcome_t *outcome) {
+    outcome->reaped = false;
+    outcome->status = 0;
+
     // Create a pipe for synchronization
     // Parent will set up profiling, then close the write end
     // Child will wait for read end to close before exec'ing
@@ -883,16 +900,21 @@ static bool run_command_pet(pmc_state_t *state, char **argv, double sample_perio
     struct sigaction old_sa;
     sigaction(SIGINT, &sa, &old_sa);
 
-    bool result = run_with_pet(state, pid, sample_period, verbose, sync_pipe[1]);
+    bool result = run_with_pet(state, pid, sample_period, verbose, sync_pipe[1],
+                               outcome);
 
     // Restore previous signal handler
     sigaction(SIGINT, &old_sa, NULL);
 
     if (g_interrupted) {
         fprintf(stderr, "\nInterrupted\n");
-        // Reap the child if still running
+        // Reap the child if still running, so its status is still reportable
         kill(pid, SIGTERM);
-        waitpid(pid, NULL, 0);
+        int status = 0;
+        if (waitpid(pid, &status, 0) == pid) {
+            outcome->reaped = true;
+            outcome->status = status;
+        }
     }
 
     return result;
@@ -1220,7 +1242,21 @@ int main(int argc, char **argv) {
     }
 
     double sample_period_sec = sample_period_ms / 1000.0;
-    bool success = run_command_pet(&state, &argv[optind], sample_period_sec, verbose);
+    child_outcome_t outcome;
+    run_command_pet(&state, &argv[optind], sample_period_sec, verbose, &outcome);
+
+    // Exit with the command's own status, as perf stat does: its exit code when
+    // it exited normally, 128 + signal when it was killed. A tool failure that
+    // stopped us reaching the command at all reports 1.
+    int exit_code = 1;
+    if (outcome.reaped) {
+        if (WIFSIGNALED(outcome.status)) {
+            psignal(WTERMSIG(outcome.status), argv[optind]);
+            exit_code = 128 + WTERMSIG(outcome.status);
+        } else {
+            exit_code = WEXITSTATUS(outcome.status);
+        }
+    }
 
     if (format == OUTPUT_JSON) {
         output_json(&state, out);
@@ -1231,5 +1267,5 @@ int main(int argc, char **argv) {
     if (out != stderr) fclose(out);
 
     pmc_cleanup(&state);
-    return success ? 0 : 1;
+    return exit_code;
 }
