@@ -1003,12 +1003,36 @@ static void output_json(pmc_state_t *state, FILE *out) {
 // CLI Interface
 // ============================================================================
 
+// perf stat takes a comma-separated list as well as repeated -e flags, and
+// harnesses tend to build one string from a list of events. Tokens point into
+// a copy that deliberately outlives this call: `events` holds them until the
+// PMU config is built. Empty tokens are skipped, so a trailing comma is fine.
+static bool add_event_list(const char *spec, const char **events, int *count) {
+    char *copy = strdup(spec);
+    if (!copy) {
+        fprintf(stderr, "Error: out of memory\n");
+        return false;
+    }
+
+    for (char *tok = strtok(copy, ","); tok; tok = strtok(NULL, ",")) {
+        if (*tok == '\0') continue;
+        if (*count >= MAX_EVENTS) {
+            fprintf(stderr, "Too many events (max %d)\n", MAX_EVENTS);
+            return false;
+        }
+        events[(*count)++] = tok;
+    }
+
+    return true;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: sudo %s [options] -- command [args...]\n"
         "\n"
         "Options:\n"
-        "  -e, --event EVENT    Add event to measure (can repeat, max 10)\n"
+        "  -e, --event EVENT[,EVENT...]\n"
+        "                       Events to measure (can repeat, max 10 total)\n"
         "  -j, --json           Output in JSON format\n"
         "  -o, --output FILE    Write the report to FILE instead of stderr\n"
         "      --append         Append to the -o file instead of truncating\n"
@@ -1128,11 +1152,8 @@ int main(int argc, char **argv) {
     while ((opt = getopt_long(argc, argv, "e:jo:P:p:vlh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'e':
-                if (event_count >= MAX_EVENTS) {
-                    fprintf(stderr, "Too many events (max %d)\n", MAX_EVENTS);
+                if (!add_event_list(optarg, events, &event_count))
                     return 1;
-                }
-                events[event_count++] = optarg;
                 break;
             case 'j':
                 format = OUTPUT_JSON;

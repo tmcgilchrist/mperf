@@ -64,8 +64,9 @@ dune build
 # Basic usage (defaults to cycles + instructions)
 sudo ./mperf-stat -- ./my_benchmark
 
-# Specify events
+# Specify events (repeated -e, or a comma-separated list, as perf stat allows)
 sudo ./mperf-stat -e cycles -e instructions -e l1d-tlb-misses -- ./benchmark
+sudo ./mperf-stat -e cycles,instructions,l1d-tlb-misses -- ./benchmark
 
 # JSON output (for scripting/parsing)
 sudo ./mperf-stat -j -e cycles -e instructions -- ./benchmark
