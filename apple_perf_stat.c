@@ -22,6 +22,7 @@
 #include <getopt.h>
 #include <signal.h>
 #include <errno.h>
+#include <locale.h>
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -929,8 +930,13 @@ typedef enum {
     OUTPUT_JSON
 } output_format_t;
 
-static void output_text(pmc_state_t *state, FILE *out) {
-    fprintf(out, "\n Performance counter stats");
+static void output_text(pmc_state_t *state, char **cmd, FILE *out) {
+    // Header mirrors perf stat's, with the thread count appended since PET
+    // aggregates across threads and perf has nothing equivalent to report.
+    fprintf(out, "\n Performance counter stats for '");
+    for (int i = 0; cmd[i]; i++)
+        fprintf(out, "%s%s", i ? " " : "", cmd[i]);
+    fprintf(out, "'");
     if (state->num_threads_seen > 0) {
         fprintf(out, " (%d thread%s)", state->num_threads_seen,
                 state->num_threads_seen == 1 ? "" : "s");
@@ -949,15 +955,17 @@ static void output_text(pmc_state_t *state, FILE *out) {
         configured_event_t *e = &state->events[i];
         fprintf(out, "  %'20llu  %-24s", (unsigned long long)e->value, e->name);
         if (strcasecmp(e->name, "instructions") == 0 && cycles > 0) {
-            fprintf(out, "  # %6.2f IPC", (double)instructions / cycles);
+            fprintf(out, "  # %7.2f  insn per cycle",
+                    (double)instructions / cycles);
         }
         fprintf(out, "\n");
     }
 
     fprintf(out, "\n");
-    fprintf(out, "  %'14.6f seconds wall time\n", state->wall_time_ns / 1e9);
-    fprintf(out, "  %'14.6f seconds user\n", state->user_time_ns / 1e9);
-    fprintf(out, "  %'14.6f seconds sys\n", state->sys_time_ns / 1e9);
+    fprintf(out, " %17.9f seconds time elapsed\n", state->wall_time_ns / 1e9);
+    fprintf(out, "\n");
+    fprintf(out, " %17.9f seconds user\n", state->user_time_ns / 1e9);
+    fprintf(out, " %17.9f seconds sys\n", state->sys_time_ns / 1e9);
     fprintf(out, "\n");
 }
 
@@ -1121,6 +1129,10 @@ static void list_events(void) {
 }
 
 int main(int argc, char **argv) {
+    // The %' thousands separators in the report are a no-op under the default C
+    // locale, so adopt the environment's locale the way perf does.
+    setlocale(LC_ALL, "");
+
     // Short flags follow perf stat where an equivalent exists. In particular
     // -p is perf's --pid, so the PET sampling period lives on -P/--period.
     enum { OPT_APPEND = 1000, OPT_LOG_FD };
@@ -1208,6 +1220,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // JSON numbers must use C formatting whatever the environment's locale is:
+    // a comma decimal separator would emit "ipc": 1,364128 and break parsers.
+    if (format == OUTPUT_JSON)
+        setlocale(LC_NUMERIC, "C");
+
     // The report goes to stderr like perf stat, leaving stdout to the measured
     // program. Resolve any redirection now so a bad path fails before we run it.
     FILE *out = stderr;
@@ -1282,7 +1299,7 @@ int main(int argc, char **argv) {
     if (format == OUTPUT_JSON) {
         output_json(&state, out);
     } else {
-        output_text(&state, out);
+        output_text(&state, &argv[optind], out);
     }
     fflush(out);
     if (out != stderr) fclose(out);

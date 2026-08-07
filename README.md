@@ -21,7 +21,7 @@ Error: Root privileges required (run with sudo)
 $ sudo ./mperf-stat -e cycles -- echo hello
 hello
 
- Performance counter stats:
+ Performance counter stats for 'echo hello' (1 thread):
 
              1,234,567  cycles
 ```
@@ -79,16 +79,20 @@ sudo ./mperf-stat -j -e cycles -e instructions -- ./benchmark
 
 **Text format:**
 ```
- Performance counter stats:
+ Performance counter stats for './my_benchmark' (3 threads):
 
          1,234,567,890  cycles
-         2,345,678,901  instructions                # 1.90 IPC
+         2,345,678,901  instructions              #    1.90  insn per cycle
             12,345,678  l1d-tlb-misses
 
-       0.543210 seconds wall time
-       0.520000 seconds user
-       0.020000 seconds sys
+       0.543210000 seconds time elapsed
+
+       0.520000000 seconds user
+       0.020000000 seconds sys
 ```
+
+Digit grouping follows the environment's locale, as it does in `perf stat`;
+under `LC_ALL=C` the counters print unseparated.
 
 **JSON format:**
 ```json
