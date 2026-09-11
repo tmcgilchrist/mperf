@@ -930,6 +930,64 @@ typedef enum {
     OUTPUT_JSON
 } output_format_t;
 
+// The metric perf prints beside a counter: GHz on cycles, insn per cycle on
+// instructions (tools/perf/util/stat-shadow.c, print_cycles and
+// print_instructions). `fmt` is perf's text format for the value; JSON ignores
+// it and always uses %f.
+//
+// GHz divides by task-clock, which is CPU time, not wall time: an N-threaded
+// program accumulates cycles on N cores at once, so wall time would report N
+// times the real clock. getrusage's user+sys is our task-clock. It covers the
+// whole child tree while PET counts only the filtered PID, so a benchmark that
+// forks helpers reads a little low.
+//
+// METRIC_UNAVAILABLE is perf's third case, where it names the unit but passes a
+// NULL format and a zero: print_metric_std() blanks the column, while
+// print_metric_json() gates on the unit alone and writes
+// "metric-value" : "0.000000". Both behaviours are reproduced, quirk included.
+typedef enum {
+    METRIC_NONE,         // perf prints no metric beside this counter
+    METRIC_UNAVAILABLE,  // perf names the unit but has no value for it
+    METRIC_OK
+} metric_status_t;
+
+static metric_status_t event_metric(pmc_state_t *state, const char *name,
+                                    double *value_out, const char **fmt_out,
+                                    const char **unit_out) {
+    u64 cycles = 0, instructions = 0;
+    for (int i = 0; i < state->event_count; i++) {
+        if (strcasecmp(state->events[i].name, "cycles") == 0)
+            cycles = state->events[i].value;
+        if (strcasecmp(state->events[i].name, "instructions") == 0)
+            instructions = state->events[i].value;
+    }
+
+    double cpu_time_ns = state->user_time_ns + state->sys_time_ns;
+    *value_out = 0.0;
+
+    // perf guards this on `cycles && nsecs`.
+    if (strcasecmp(name, "cycles") == 0) {
+        *fmt_out = "%8.3f";
+        *unit_out = "GHz";
+        if (cycles == 0 || cpu_time_ns <= 0) return METRIC_UNAVAILABLE;
+        // Cycles per nanosecond is already GHz.
+        *value_out = (double)cycles / cpu_time_ns;
+        return METRIC_OK;
+    }
+
+    // perf guards this on the cycles counter alone, so asking for
+    // instructions without cycles yields the unit with no value.
+    if (strcasecmp(name, "instructions") == 0) {
+        *fmt_out = "%7.2f ";
+        *unit_out = "insn per cycle";
+        if (cycles == 0) return METRIC_UNAVAILABLE;
+        *value_out = (double)instructions / cycles;
+        return METRIC_OK;
+    }
+
+    return METRIC_NONE;
+}
+
 static void output_text(pmc_state_t *state, char **cmd, FILE *out) {
     // Header mirrors perf stat's, with the thread count appended since PET
     // aggregates across threads and perf has nothing equivalent to report.
@@ -943,20 +1001,18 @@ static void output_text(pmc_state_t *state, char **cmd, FILE *out) {
     }
     fprintf(out, ":\n\n");
 
-    u64 cycles = 0, instructions = 0;
-    for (int i = 0; i < state->event_count; i++) {
-        if (strcasecmp(state->events[i].name, "cycles") == 0)
-            cycles = state->events[i].value;
-        if (strcasecmp(state->events[i].name, "instructions") == 0)
-            instructions = state->events[i].value;
-    }
-
     for (int i = 0; i < state->event_count; i++) {
         configured_event_t *e = &state->events[i];
         fprintf(out, "  %'20llu  %-24s", (unsigned long long)e->value, e->name);
-        if (strcasecmp(e->name, "instructions") == 0 && cycles > 0) {
-            fprintf(out, "  # %7.2f  insn per cycle",
-                    (double)instructions / cycles);
+
+        // perf lays the metric out as " # ", the value, a space, then the unit;
+        // the widths come from its format strings, so the columns line up.
+        double value;
+        const char *fmt, *unit;
+        if (event_metric(state, e->name, &value, &fmt, &unit) == METRIC_OK) {
+            fprintf(out, "  # ");
+            fprintf(out, fmt, value);
+            fprintf(out, " %s", unit);
         }
         fprintf(out, "\n");
     }
@@ -986,14 +1042,6 @@ static void json_metric_line(FILE *out, double value, const char *unit) {
 }
 
 static void output_json(pmc_state_t *state, FILE *out) {
-    u64 cycles = 0, instructions = 0;
-    for (int i = 0; i < state->event_count; i++) {
-        if (strcasecmp(state->events[i].name, "cycles") == 0)
-            cycles = state->events[i].value;
-        if (strcasecmp(state->events[i].name, "instructions") == 0)
-            instructions = state->events[i].value;
-    }
-
     for (int i = 0; i < state->event_count; i++) {
         configured_event_t *e = &state->events[i];
 
@@ -1004,11 +1052,13 @@ static void output_json(pmc_state_t *state, FILE *out) {
         fprintf(out, ", \"event-runtime\" : %llu, \"pcnt-running\" : 100.00",
                 (unsigned long long)state->wall_time_ns);
 
-        // perf carries a counter's derived metric on the counter's own object.
-        if (strcasecmp(e->name, "instructions") == 0 && cycles > 0) {
-            fprintf(out, ", \"metric-value\" : \"%f\", "
-                         "\"metric-unit\" : \"insn per cycle\"",
-                    (double)instructions / cycles);
+        // perf carries a counter's derived metric on the counter's own object,
+        // including the zero it writes for a metric it could not compute.
+        double value;
+        const char *fmt, *unit;
+        if (event_metric(state, e->name, &value, &fmt, &unit) != METRIC_NONE) {
+            fprintf(out, ", \"metric-value\" : \"%f\", \"metric-unit\" : \"%s\"",
+                    value, unit);
         }
         fprintf(out, "}\n");
     }

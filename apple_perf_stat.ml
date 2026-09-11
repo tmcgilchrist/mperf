@@ -22,6 +22,7 @@ type time_info = {
 type derived_metrics = {
   ipc : float option;
   cpi : float option;
+  ghz : float option;
 }
 
 type measurement = {
@@ -87,6 +88,15 @@ module Json_parse = struct
          | Some u when u = unit -> float_field "metric-value" line
          | _ -> None)
       lines
+
+  (* perf names a metric's unit even when it has no value for it, writing
+     "metric-value" : "0.000000", and mperf reproduces that. Neither a clock
+     speed nor an insn-per-cycle figure can genuinely be zero, so read a zero
+     as absent rather than passing it on as a measurement. *)
+  let computed_metric unit lines =
+    match metric unit lines with
+    | Some v when v > 0.0 -> Some v
+    | _ -> None
 end
 
 let parse_json_output output =
@@ -114,10 +124,11 @@ let parse_json_output output =
   } in
 
   (* perf reports insn per cycle only, leaving the reciprocal to the caller. *)
-  let ipc = Json_parse.metric "insn per cycle" lines in
+  let ipc = Json_parse.computed_metric "insn per cycle" lines in
   let derived = {
     ipc;
     cpi = (match ipc with Some i when i > 0.0 -> Some (1.0 /. i) | _ -> None);
+    ghz = Json_parse.computed_metric "GHz" lines;
   } in
 
   let threads_measured =
@@ -218,6 +229,9 @@ let pp_result fmt result =
   Format.fprintf fmt "  sys:  %.6f s@." (result.time.sys_ns /. 1e9);
   (match result.derived.ipc with
    | Some ipc -> Format.fprintf fmt "IPC: %.4f@." ipc
+   | None -> ());
+  (match result.derived.ghz with
+   | Some ghz -> Format.fprintf fmt "Clock: %.3f GHz@." ghz
    | None -> ());
   Format.fprintf fmt "@]"
 

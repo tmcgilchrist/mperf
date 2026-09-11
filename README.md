@@ -81,7 +81,7 @@ sudo ./mperf-stat -j -e cycles -e instructions -- ./benchmark
 ```
  Performance counter stats for './my_benchmark' (3 threads):
 
-         1,234,567,890  cycles
+         1,234,567,890  cycles                    #    2.286 GHz
          2,345,678,901  instructions              #    1.90  insn per cycle
             12,345,678  l1d-tlb-misses
 
@@ -101,7 +101,7 @@ object per counter, no enclosing array, and each counter's derived metric
 carried on the counter's own object.
 
 ```json
-{"counter-value" : "1234567890.000000", "unit" : "", "event" : "cycles", "event-runtime" : 543210000, "pcnt-running" : 100.00}
+{"counter-value" : "1234567890.000000", "unit" : "", "event" : "cycles", "event-runtime" : 543210000, "pcnt-running" : 100.00, "metric-value" : "2.286237", "metric-unit" : "GHz"}
 {"counter-value" : "2345678901.000000", "unit" : "", "event" : "instructions", "event-runtime" : 543210000, "pcnt-running" : 100.00, "metric-value" : "1.900000", "metric-unit" : "insn per cycle"}
 {"counter-value" : "12345678.000000", "unit" : "", "event" : "l1d-tlb-misses", "event-runtime" : 543210000, "pcnt-running" : 100.00}
 {"metric-value" : "0.543210", "metric-unit" : "seconds time elapsed"}
@@ -121,6 +121,21 @@ sys times it shows in text output are simply absent from its JSON. mperf
 appends them as metric-only objects using perf's own footer unit strings,
 followed by the thread count that PET aggregated over. A parser written for
 `perf stat --json` reads the counter lines unchanged and can ignore the rest.
+
+### Derived metrics
+
+Like `perf stat`, mperf prints a counter's derived metric beside that counter,
+in both text and JSON:
+
+| Counter        | Metric           | Computed as           |
+|----------------|------------------|-----------------------|
+| `cycles`       | `GHz`            | cycles / CPU time     |
+| `instructions` | `insn per cycle` | instructions / cycles |
+
+`GHz` divides by CPU time (user + sys) rather than elapsed wall time, matching
+perf's `task-clock` denominator; dividing by wall time would report roughly N
+times the real clock for an N-threaded program. A metric perf cannot compute is
+reported as a zero, as perf reports it.
 
 ### OCaml Library
 
