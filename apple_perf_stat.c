@@ -969,26 +969,23 @@ static void output_text(pmc_state_t *state, char **cmd, FILE *out) {
     fprintf(out, "\n");
 }
 
+// perf stat --json emits newline-delimited JSON: one object per counter, no
+// enclosing array, and -- because perf's print_footer() returns early for JSON
+// -- no elapsed/user/sys lines at all. The counter objects below are field for
+// field what perf writes, so a parser built for `perf stat --json` reads them
+// unchanged. The timing perf drops is appended afterwards as metric-only
+// objects, reusing the unit strings from perf's own text footer.
+//
+// Two fields are constants here rather than measurements. PET keeps every
+// requested counter physically active for the whole run (there is no
+// multiplexing, hence the hard limit of 10 events), so the interval an event
+// was enabled is just the wall time, and the running percentage is always 100.
+static void json_metric_line(FILE *out, double value, const char *unit) {
+    fprintf(out, "{\"metric-value\" : \"%f\", \"metric-unit\" : \"%s\"}\n",
+            value, unit);
+}
+
 static void output_json(pmc_state_t *state, FILE *out) {
-    fprintf(out, "{\n");
-    fprintf(out, "  \"counters\": {\n");
-
-    for (int i = 0; i < state->event_count; i++) {
-        configured_event_t *e = &state->events[i];
-        fprintf(out, "    \"%s\": %llu%s\n",
-                e->name,
-                (unsigned long long)e->value,
-                i < state->event_count - 1 ? "," : "");
-    }
-
-    fprintf(out, "  },\n");
-    fprintf(out, "  \"time\": {\n");
-    fprintf(out, "    \"wall_ns\": %.0f,\n", state->wall_time_ns);
-    fprintf(out, "    \"user_ns\": %.0f,\n", state->user_time_ns);
-    fprintf(out, "    \"sys_ns\": %.0f\n", state->sys_time_ns);
-    fprintf(out, "  },\n");
-
-    fprintf(out, "  \"derived\": {\n");
     u64 cycles = 0, instructions = 0;
     for (int i = 0; i < state->event_count; i++) {
         if (strcasecmp(state->events[i].name, "cycles") == 0)
@@ -997,14 +994,32 @@ static void output_json(pmc_state_t *state, FILE *out) {
             instructions = state->events[i].value;
     }
 
-    if (cycles > 0 && instructions > 0) {
-        fprintf(out, "    \"ipc\": %.6f,\n", (double)instructions / cycles);
-        fprintf(out, "    \"cpi\": %.6f\n", (double)cycles / instructions);
-    }
-    fprintf(out, "  },\n");
+    for (int i = 0; i < state->event_count; i++) {
+        configured_event_t *e = &state->events[i];
 
-    fprintf(out, "  \"threads_measured\": %d\n", state->num_threads_seen);
-    fprintf(out, "}\n");
+        // perf quotes counter-value and prints it as a double; the empty unit
+        // is what perf emits for a plain hardware event.
+        fprintf(out, "{\"counter-value\" : \"%f\", \"unit\" : \"\", "
+                     "\"event\" : \"%s\"", (double)e->value, e->name);
+        fprintf(out, ", \"event-runtime\" : %llu, \"pcnt-running\" : 100.00",
+                (unsigned long long)state->wall_time_ns);
+
+        // perf carries a counter's derived metric on the counter's own object.
+        if (strcasecmp(e->name, "instructions") == 0 && cycles > 0) {
+            fprintf(out, ", \"metric-value\" : \"%f\", "
+                         "\"metric-unit\" : \"insn per cycle\"",
+                    (double)instructions / cycles);
+        }
+        fprintf(out, "}\n");
+    }
+
+    json_metric_line(out, state->wall_time_ns / 1e9, "seconds time elapsed");
+    json_metric_line(out, state->user_time_ns / 1e9, "seconds user");
+    json_metric_line(out, state->sys_time_ns / 1e9, "seconds sys");
+
+    // No perf equivalent: PET aggregates across threads and perf has nothing to
+    // report here, so it rides along in the same shape the text header uses.
+    json_metric_line(out, (double)state->num_threads_seen, "threads measured");
 }
 
 // ============================================================================
@@ -1041,7 +1056,8 @@ static void usage(const char *prog) {
         "Options:\n"
         "  -e, --event EVENT[,EVENT...]\n"
         "                       Events to measure (can repeat, max 10 total)\n"
-        "  -j, --json           Output in JSON format\n"
+        "  -j, --json           Output newline-delimited JSON, one object per\n"
+        "                       counter, as perf stat --json does\n"
         "  -o, --output FILE    Write the report to FILE instead of stderr\n"
         "      --append         Append to the -o file instead of truncating\n"
         "      --log-fd FD      Write the report to file descriptor FD\n"

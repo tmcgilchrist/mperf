@@ -95,24 +95,32 @@ Digit grouping follows the environment's locale, as it does in `perf stat`;
 under `LC_ALL=C` the counters print unseparated.
 
 **JSON format:**
+
+`-j` emits newline-delimited JSON in the same shape as `perf stat --json`: one
+object per counter, no enclosing array, and each counter's derived metric
+carried on the counter's own object.
+
 ```json
-{
-  "counters": {
-    "cycles": 1234567890,
-    "instructions": 2345678901,
-    "l1d-tlb-misses": 12345678
-  },
-  "time": {
-    "wall_ns": 543210000,
-    "user_ns": 520000000,
-    "sys_ns": 20000000
-  },
-  "derived": {
-    "ipc": 1.9000,
-    "cpi": 0.5263
-  }
-}
+{"counter-value" : "1234567890.000000", "unit" : "", "event" : "cycles", "event-runtime" : 543210000, "pcnt-running" : 100.00}
+{"counter-value" : "2345678901.000000", "unit" : "", "event" : "instructions", "event-runtime" : 543210000, "pcnt-running" : 100.00, "metric-value" : "1.900000", "metric-unit" : "insn per cycle"}
+{"counter-value" : "12345678.000000", "unit" : "", "event" : "l1d-tlb-misses", "event-runtime" : 543210000, "pcnt-running" : 100.00}
+{"metric-value" : "0.543210", "metric-unit" : "seconds time elapsed"}
+{"metric-value" : "0.520000", "metric-unit" : "seconds user"}
+{"metric-value" : "0.020000", "metric-unit" : "seconds sys"}
+{"metric-value" : "3.000000", "metric-unit" : "threads measured"}
 ```
+
+`counter-value` is a quoted decimal and `pcnt-running` is unquoted, matching
+perf's own formatting rather than tidying it up. Since PET keeps every
+requested counter physically active for the whole run, `pcnt-running` is always
+`100.00` and `event-runtime` is the elapsed wall time in nanoseconds.
+
+The last four lines are an extension. `perf stat --json` prints no footer at
+all — `print_footer()` returns early in JSON mode — so the elapsed, user and
+sys times it shows in text output are simply absent from its JSON. mperf
+appends them as metric-only objects using perf's own footer unit strings,
+followed by the thread count that PET aggregated over. A parser written for
+`perf stat --json` reads the counter lines unchanged and can ignore the rest.
 
 ### OCaml Library
 
@@ -265,6 +273,7 @@ The tool tracks up to 256 unique threads. For programs with more threads, some d
 | Counting       | Exact when within HW counter limit; scaled estimates when multiplexing | Sampling-based (PET), all counters always active |
 | Root required  | Some events                                | All events                                |
 | Output formats | Text, JSON, CSV                            | Text, JSON                                |
+| JSON shape     | NDJSON, one object per counter, no footer  | Same, plus timing/thread metric objects   |
 | Report stream  | stderr; `-o`, `--append`, `--log-fd`       | Same                                      |
 | Exit status    | Command's exit code, or 128 + signal       | Same                                      |
 | HW counters    | 4-8 GP + 3-4 fixed (varies by CPU)        | Varies: 2-3 fixed + 4-8 configurable      |
