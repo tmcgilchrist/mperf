@@ -46,6 +46,8 @@ type time_info = {
 type derived_metrics = {
   ipc : float option;  (** Instructions per cycle *)
   cpi : float option;  (** Cycles per instruction *)
+  ghz : float option;  (** Average clock while running: cycles per nanosecond
+                           of CPU time, as [perf stat] reports it *)
 }
 
 (** Result of a PMC measurement run *)

@@ -22,6 +22,7 @@ type time_info = {
 type derived_metrics = {
   ipc : float option;
   cpi : float option;
+  ghz : float option;
 }
 
 type measurement = {
@@ -44,128 +45,98 @@ let tool_path = ref "/usr/local/bin/apple-perf-stat"
 
 let set_tool_path path = tool_path := path
 
-(* JSON parsing - minimal implementation without external deps *)
+(* JSON parsing - minimal implementation without external deps.
+
+   The tool emits perf stat --json's newline-delimited JSON: one object per
+   line, with no enclosing array. Counter objects carry "event" and
+   "counter-value"; the timings and the thread count arrive as metric-only
+   objects, because perf writes no footer at all in JSON mode. *)
 module Json_parse = struct
-  (* Very simple JSON parser for our specific output format *)
-  
-  let trim s = String.trim s
-  
-  let parse_number s =
-    let s = trim s in
-    try Some (Float.of_string s)
-    with _ -> 
-      try Some (Int64.to_float (Int64.of_string s))
-      with _ -> None
-  
-  let parse_int64 s =
-    let s = trim s in
-    try Some (Int64.of_string s)
-    with _ ->
-      try Some (Int64.of_float (Float.of_string s))
-      with _ -> None
-  
-  (* Extract value for a key from JSON-like text *)
-  let find_value key text =
-    let pattern = Printf.sprintf "\"%s\":" key in
-    try
-      let start = Str.search_forward (Str.regexp_string pattern) text 0 in
-      let after_key = start + String.length pattern in
-      (* Find the value - either a number or nested object *)
-      let rest = String.sub text after_key (String.length text - after_key) in
-      let rest = trim rest in
-      (* Find end of value (comma, }, or end of string) *)
-      let end_pos = 
-        try min 
-          (try Str.search_forward (Str.regexp "[,}]") rest 0 with Not_found -> max_int)
-          (String.length rest)
-        with _ -> String.length rest
-      in
-      Some (trim (String.sub rest 0 end_pos))
-    with Not_found -> None
-  
-  (* Extract all key-value pairs from a section *)
-  let extract_section section_name text =
-    let pattern = Printf.sprintf "\"%s\":" section_name in
-    try
-      let start = Str.search_forward (Str.regexp_string pattern) text 0 in
-      let after_key = start + String.length pattern in
-      let rest = String.sub text after_key (String.length text - after_key) in
-      (* Find matching braces *)
-      let brace_start = String.index rest '{' in
-      let rec find_end pos depth =
-        if pos >= String.length rest then pos
-        else match rest.[pos] with
-          | '{' -> find_end (pos + 1) (depth + 1)
-          | '}' -> if depth = 1 then pos + 1 else find_end (pos + 1) (depth - 1)
-          | _ -> find_end (pos + 1) depth
-      in
-      let brace_end = find_end brace_start 0 in
-      Some (String.sub rest brace_start (brace_end - brace_start))
-    with _ -> None
-  
-  (* Parse counter values from counters section *)
-  let parse_counters text =
-    match extract_section "counters" text with
-    | None -> []
-    | Some section ->
-      (* Match "key": value patterns *)
-      let re = Str.regexp "\"\\([^\"]+\\)\"[ \t\n]*:[ \t\n]*\\([0-9]+\\)" in
-      let rec find_all pos acc =
-        try
-          let _ = Str.search_forward re section pos in
-          let key = Str.matched_group 1 section in
-          let value = Str.matched_group 2 section in
-          let next = Str.match_end () in
-          match parse_int64 value with
-          | Some v -> find_all next ((key, v) :: acc)
-          | None -> find_all next acc
-        with Not_found -> List.rev acc
-      in
-      find_all 0 []
-  
-  (* Parse time section *)
-  let parse_time text =
-    let get_float key default =
-      match extract_section "time" text with
-      | None -> default
-      | Some section ->
-        match find_value key section with
-        | Some v -> (match parse_number v with Some f -> f | None -> default)
-        | None -> default
+  (* Value of [key] within a single NDJSON line. Values are either quoted
+     ("counter-value" : "123.000000") or bare ("event-runtime" : 4096); both
+     come back as raw text with the quotes stripped. *)
+  let find_field key line =
+    let re =
+      Str.regexp
+        ("\"" ^ Str.quote key
+         ^ "\"[ \t]*:[ \t]*\\(\"\\([^\"]*\\)\"\\|[-+0-9.eE]+\\)")
     in
-    {
-      wall_ns = get_float "wall_ns" 0.0;
-      user_ns = get_float "user_ns" 0.0;
-      sys_ns = get_float "sys_ns" 0.0;
-    }
-  
-  (* Parse derived metrics *)
-  let parse_derived text =
-    let get_float key =
-      match extract_section "derived" text with
-      | None -> None
-      | Some section ->
-        match find_value key section with
-        | Some v -> parse_number v
-        | None -> None
-    in
-    {
-      ipc = get_float "ipc";
-      cpi = get_float "cpi";
-    }
+    match Str.search_forward re line 0 with
+    | exception Not_found -> None
+    | _ ->
+      (* Group 2 participates only when the quoted branch matched. *)
+      (match Str.matched_group 2 line with
+       | s -> Some s
+       | exception Not_found -> Some (Str.matched_group 1 line))
+
+  let float_field key line =
+    match find_field key line with
+    | None -> None
+    | Some s -> float_of_string_opt (String.trim s)
+
+  let lines text =
+    String.split_on_char '\n' text
+    |> List.filter (fun l -> String.trim l <> "")
+
+  (* A metric is identified by its unit string, which is the one perf prints in
+     its text footer. Counter objects carry their own metric, so this also
+     finds "insn per cycle" on the instructions line. *)
+  let metric unit lines =
+    List.find_map
+      (fun line ->
+         match find_field "metric-unit" line with
+         | Some u when u = unit -> float_field "metric-value" line
+         | _ -> None)
+      lines
+
+  (* perf names a metric's unit even when it has no value for it, writing
+     "metric-value" : "0.000000", and mperf reproduces that. Neither a clock
+     speed nor an insn-per-cycle figure can genuinely be zero, so read a zero
+     as absent rather than passing it on as a measurement. *)
+  let computed_metric unit lines =
+    match metric unit lines with
+    | Some v when v > 0.0 -> Some v
+    | _ -> None
 end
 
 let parse_json_output output =
-  let counters = Json_parse.parse_counters output in
-  let time = Json_parse.parse_time output in
-  let derived = Json_parse.parse_derived output in
-  let threads_measured = 
-    match Json_parse.find_value "threads_measured" output with
-    | Some v -> (match Json_parse.parse_int64 v with 
-                 | Some n -> Int64.to_int n 
-                 | None -> 0)
+  let lines = Json_parse.lines output in
+
+  let counters =
+    List.filter_map
+      (fun line ->
+         match
+           Json_parse.find_field "event" line,
+           Json_parse.float_field "counter-value" line
+         with
+         | Some name, Some value -> Some (name, Int64.of_float value)
+         | _ -> None)
+      lines
+  in
+
+  let seconds unit =
+    match Json_parse.metric unit lines with Some s -> s *. 1e9 | None -> 0.0
+  in
+  let time = {
+    wall_ns = seconds "seconds time elapsed";
+    user_ns = seconds "seconds user";
+    sys_ns = seconds "seconds sys";
+  } in
+
+  (* perf reports insn per cycle only, leaving the reciprocal to the caller. *)
+  let ipc = Json_parse.computed_metric "insn per cycle" lines in
+  let derived = {
+    ipc;
+    cpi = (match ipc with Some i when i > 0.0 -> Some (1.0 /. i) | _ -> None);
+    ghz = Json_parse.computed_metric "GHz" lines;
+  } in
+
+  let threads_measured =
+    match Json_parse.metric "threads measured" lines with
+    | Some t -> int_of_float t
     | None -> 0
   in
+
   { counters; time; derived; threads_measured; exit_code = 0 }
 
 let run ?(events = ["cycles"; "instructions"]) ?(sample_period_ms = 1.0) command =
@@ -258,6 +229,9 @@ let pp_result fmt result =
   Format.fprintf fmt "  sys:  %.6f s@." (result.time.sys_ns /. 1e9);
   (match result.derived.ipc with
    | Some ipc -> Format.fprintf fmt "IPC: %.4f@." ipc
+   | None -> ());
+  (match result.derived.ghz with
+   | Some ghz -> Format.fprintf fmt "Clock: %.3f GHz@." ghz
    | None -> ());
   Format.fprintf fmt "@]"
 
