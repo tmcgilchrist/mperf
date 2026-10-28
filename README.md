@@ -21,7 +21,7 @@ Error: Root privileges required (run with sudo)
 $ sudo ./mperf-stat -e cycles -- echo hello
 hello
 
- Performance counter stats for 'echo hello' (1 thread):
+ Performance counter stats for 'echo hello':
 
              1,234,567  cycles
 ```
@@ -100,8 +100,9 @@ As with `perf stat -p`, an attached run has no user/sys lines and exits 0. A lau
 
 **Text format:**
 ```
- Performance counter stats for './my_benchmark' (3 threads):
+ Performance counter stats for './my_benchmark':
 
+           525.43 msec  task-clock
          1,234,567,890  cycles                    #    2.286 GHz
          2,345,678,901  instructions              #    1.90  insn per cycle
             12,345,678  l1d-tlb-misses
@@ -117,46 +118,34 @@ under `LC_ALL=C` the counters print unseparated.
 
 **JSON format:**
 
-`-j` emits newline-delimited JSON in the same shape as `perf stat --json`: one
-object per counter, no enclosing array, and each counter's derived metric
-carried on the counter's own object.
+`-j` emits newline-delimited JSON in the same shape as perf 7.0's
+`perf stat --json -e`: one object per event, no enclosing array, and no
+metrics or footer.
 
 ```json
-{"counter-value" : "1234567890.000000", "unit" : "", "event" : "cycles", "event-runtime" : 543210000, "pcnt-running" : 100.00, "metric-value" : "2.286237", "metric-unit" : "GHz"}
-{"counter-value" : "2345678901.000000", "unit" : "", "event" : "instructions", "event-runtime" : 543210000, "pcnt-running" : 100.00, "metric-value" : "1.900000", "metric-unit" : "insn per cycle"}
-{"counter-value" : "12345678.000000", "unit" : "", "event" : "l1d-tlb-misses", "event-runtime" : 543210000, "pcnt-running" : 100.00}
-{"metric-value" : "0.543210", "metric-unit" : "seconds time elapsed"}
-{"metric-value" : "0.520000", "metric-unit" : "seconds user"}
-{"metric-value" : "0.020000", "metric-unit" : "seconds sys"}
-{"metric-value" : "3.000000", "metric-unit" : "threads measured"}
+{"counter-value" : "525.430000", "unit" : "msec", "event" : "task-clock", "event-runtime" : 525430000, "pcnt-running" : 100.00}
+{"counter-value" : "1234567890.000000", "unit" : "", "event" : "cycles", "event-runtime" : 525430000, "pcnt-running" : 100.00}
+{"counter-value" : "543210000.000000", "unit" : "", "event" : "duration_time", "event-runtime" : 1, "pcnt-running" : 100.00}
 ```
 
-`counter-value` is a quoted decimal and `pcnt-running` is unquoted, matching
-perf's own formatting rather than tidying it up. Since PET keeps every
-requested counter physically active for the whole run, `pcnt-running` is always
-`100.00` and `event-runtime` is the elapsed wall time in nanoseconds.
-
-The last four lines are an extension. `perf stat --json` prints no footer at
-all — `print_footer()` returns early in JSON mode — so the elapsed, user and
-sys times it shows in text output are simply absent from its JSON. mperf
-appends them as metric-only objects using perf's own footer unit strings,
-followed by the thread count that PET aggregated over. A parser written for
-`perf stat --json` reads the counter lines unchanged and can ignore the rest.
+As in perf, `event-runtime` is the task-clock time in nanoseconds, and the
+tool events `duration_time`, `user_time` and `system_time` give nanoseconds
+with an `event-runtime` of 1. PET keeps every counter active for the whole
+run, so `pcnt-running` is always `100.00`. To get elapsed, user and sys
+times in JSON, name those tool events with `-e`.
 
 ### Derived metrics
 
-Like `perf stat`, mperf prints a counter's derived metric beside that counter,
-in both text and JSON:
+In text output, mperf prints a counter's derived metric beside it, as
+`perf stat` does:
 
-| Counter        | Metric           | Computed as           |
-|----------------|------------------|-----------------------|
-| `cycles`       | `GHz`            | cycles / CPU time     |
-| `instructions` | `insn per cycle` | instructions / cycles |
+| Counter        | Metric           | Computed as             |
+|----------------|------------------|-------------------------|
+| `cycles`       | `GHz`            | cycles / task-clock     |
+| `instructions` | `insn per cycle` | instructions / cycles   |
 
-`GHz` divides by CPU time (user + sys) rather than elapsed wall time, matching
-perf's `task-clock` denominator; dividing by wall time would report roughly N
-times the real clock for an N-threaded program. A metric perf cannot compute is
-reported as a zero, as perf reports it.
+`GHz` appears only when `task-clock` is in the event list. JSON carries no
+metrics, matching perf 7.0 with `-e`.
 
 ### OCaml Library
 
@@ -209,6 +198,19 @@ These aliases work across Apple Silicon and Intel:
 | `ref-cycles`         | Reference cycles (fixed)    | Intel only   |
 | `map-stalls`         | Map unit stall cycles       | Apple Silicon only |
 | `dispatch-stalls`    | Dispatch stall cycles       | Apple Silicon only |
+
+### Software and Tool Events
+
+| Event                   | Description                                  |
+|-------------------------|----------------------------------------------|
+| `task-clock`            | On-CPU time of the command's threads, in msec |
+| `page-faults`, `faults` | Page faults taken by the command's threads   |
+| `duration_time`         | Elapsed wall time, in ns                     |
+| `user_time`             | User CPU time, in ns (0 when attached)       |
+| `system_time`           | System CPU time, in ns (0 when attached)     |
+
+These come from a kernel trace of context switches and page faults rather
+than from the PMU, so they don't take up a hardware counter.
 
 ### Raw Events
 
@@ -283,6 +285,8 @@ The number of hardware counters varies by architecture:
 | Apple Silicon | 2              | 8                     | 10         |
 | Intel         | 3              | 4-8 (varies by model) | 7-11       |
 
+Software and tool events don't count toward this, up to 16 events in all.
+
 Run `./mperf-stat -l` to see the counter counts for your CPU.
 
 ### Sampling Accuracy
@@ -309,7 +313,8 @@ The tool tracks up to 256 unique threads. For programs with more threads, some d
 | Counting       | Exact when within HW counter limit; scaled estimates when multiplexing | Sampling-based (PET), all counters always active |
 | Root required  | Some events                                | All events                                |
 | Output formats | Text, JSON, CSV                            | Text, JSON                                |
-| JSON shape     | NDJSON, one object per counter, no footer  | Same, plus timing/thread metric objects   |
+| JSON shape     | NDJSON, one object per counter, no footer  | Same                                      |
+| Software and tool events | `task-clock`, `page-faults`, `duration_time`, `user_time`, `system_time`, and more | Those five |
 | Report stream  | stderr; `-o`, `--append`, `--log-fd`       | Same                                      |
 | Exit status    | Command's exit code, or 128 + signal       | Same                                      |
 | Attach         | `-p PID`                                   | Same                                      |

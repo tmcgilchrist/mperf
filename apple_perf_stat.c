@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/kdebug.h>
+#include <mach/mach_time.h>
 #include <sys/event.h>
 #include <sys/proc_info.h>
 #include <libproc.h>
@@ -200,6 +201,25 @@ typedef struct {
 #define PERF_KPC              6
 #define PERF_KPC_DATA_THREAD  8
 
+// task-clock and page-faults come from the same trace. A context switch is
+// logged by the outgoing thread (arg5) and names the incoming one (arg2);
+// stack_handoff() switches without a MACH_SCHED record, so it is needed too.
+// A fault is logged by the faulting thread.
+#define SCHED_SWITCH_EVENT    MACHDBG_CODE(DBG_MACH_SCHED, MACH_SCHED)
+#define SCHED_HANDOFF_EVENT   MACHDBG_CODE(DBG_MACH_SCHED, MACH_STACK_HANDOFF)
+#define VM_FAULT_EVENT        MACHDBG_CODE(DBG_MACH_VM, 2)  // vm_fault()
+
+// KERN_KDGETBUF's reply (kbufinfo_t in XNU)
+typedef struct {
+    int nkdbufs;
+    int nolog;
+    unsigned int flags;
+    int nkdthreads;
+    int bufid;
+} kd_bufinfo_t;
+
+#define KDBG_WRAPPED 0x0008
+
 // ============================================================================
 // Framework Loading
 // ============================================================================
@@ -322,6 +342,14 @@ static int kdebug_trace_read(void *buf, usize len, usize *count) {
     return 0;
 }
 
+// The kernel overwrote events we had not read yet.
+static bool kdebug_wrapped(void) {
+    kd_bufinfo_t info = { 0 };
+    usize size = sizeof(info);
+    int mib[3] = { CTL_KERN, KERN_KDEBUG, KERN_KDGETBUF };
+    return sysctl(mib, 3, &info, &size, NULL, 0) == 0 && (info.flags & KDBG_WRAPPED);
+}
+
 // Lightweight PET mode (not in framework, use sysctl directly)
 static int kperf_lightweight_pet_set(u32 enabled) {
     return sysctlbyname("kperf.lightweight_pet", NULL, NULL, &enabled, 4);
@@ -379,11 +407,41 @@ static kpep_event *find_event(kpep_db *db, const char *name) {
 // PMC State
 // ============================================================================
 
-#define MAX_EVENTS 10
+#define MAX_EVENTS 10   // hardware counters
+#define MAX_LISTED 16   // everything -e may name, software and tool events too
+
+// perf's software events that mperf derives from the kernel trace, and its
+// tool events, which are just the run's own times. Anything else is a PMC.
+typedef enum {
+    EVENT_PMC,
+    EVENT_TASK_CLOCK,     // ns on CPU, reported in msec
+    EVENT_PAGE_FAULTS,
+    EVENT_DURATION_TIME,  // the rest are ns
+    EVENT_USER_TIME,
+    EVENT_SYSTEM_TIME
+} event_kind_t;
+
+static const struct { const char *name; event_kind_t kind; } named_events[] = {
+    { "task-clock",    EVENT_TASK_CLOCK },
+    { "page-faults",   EVENT_PAGE_FAULTS },
+    { "faults",        EVENT_PAGE_FAULTS },  // perf's alias
+    { "duration_time", EVENT_DURATION_TIME },
+    { "user_time",     EVENT_USER_TIME },
+    { "system_time",   EVENT_SYSTEM_TIME },
+    { NULL, EVENT_PMC }
+};
+
+static event_kind_t event_kind(const char *name) {
+    for (int i = 0; named_events[i].name; i++)
+        if (strcmp(name, named_events[i].name) == 0) return named_events[i].kind;
+    return EVENT_PMC;
+}
 
 typedef struct {
     const char *name;
-    kpep_event *event;
+    event_kind_t kind;
+    kpep_event *event;   // EVENT_PMC only
+    int pmc_index;       // EVENT_PMC only: position in the kpep config
     u64 value;
 } configured_event_t;
 
@@ -396,15 +454,16 @@ typedef struct {
     kpc_config_t regs[KPC_MAX_COUNTERS];
     usize counter_map[KPC_MAX_COUNTERS];
 
-    configured_event_t events[MAX_EVENTS];
+    configured_event_t events[MAX_LISTED];
     int event_count;
+    int pmc_count;
+    bool count_faults;   // page-faults was asked for
 
     double wall_time_ns;
     double user_time_ns;
     double sys_time_ns;
-
-    // PET-specific
-    int num_threads_seen;
+    u64 task_clock_ns;   // always measured: it is every counter's event-runtime
+    u64 page_faults;
 
     // -p target; 0 when mperf launched the command itself
     pid_t attached_pid;
@@ -437,9 +496,11 @@ static bool pmc_init(pmc_state_t *state) {
     return true;
 }
 
-static bool pmc_add_event(pmc_state_t *state, const char *name) {
-    if (state->event_count >= MAX_EVENTS) {
-        fprintf(stderr, "Error: Too many events (max %d)\n", MAX_EVENTS);
+// Adds a hardware counter to the kpep config; `listed` says whether it is
+// reported or only there so that PET has something to sample.
+static bool pmc_add_counter(pmc_state_t *state, const char *name, bool listed) {
+    if (state->pmc_count >= MAX_EVENTS) {
+        fprintf(stderr, "Error: Too many hardware events (max %d)\n", MAX_EVENTS);
         return false;
     }
 
@@ -458,10 +519,30 @@ static bool pmc_add_event(pmc_state_t *state, const char *name) {
         return false;
     }
 
-    state->events[state->event_count].name = name;
-    state->events[state->event_count].event = ev;
-    state->event_count++;
+    if (listed) {
+        configured_event_t *e = &state->events[state->event_count++];
+        e->name = name;
+        e->kind = EVENT_PMC;
+        e->event = ev;
+        e->pmc_index = state->pmc_count;
+    }
+    state->pmc_count++;
+    return true;
+}
 
+static bool pmc_add_event(pmc_state_t *state, const char *name) {
+    if (state->event_count >= MAX_LISTED) {
+        fprintf(stderr, "Error: Too many events (max %d)\n", MAX_LISTED);
+        return false;
+    }
+
+    event_kind_t kind = event_kind(name);
+    if (kind == EVENT_PMC) return pmc_add_counter(state, name, true);
+
+    configured_event_t *e = &state->events[state->event_count++];
+    e->name = name;
+    e->kind = kind;
+    if (kind == EVENT_PAGE_FAULTS) state->count_faults = true;
     return true;
 }
 
@@ -530,6 +611,95 @@ static thread_data_t *tracker_get_or_create(thread_tracker_t *tracker, u32 tid) 
     memset(t, 0, sizeof(*t));
     t->tid = tid;
     return t;
+}
+
+// ============================================================================
+// task-clock and page-faults from the scheduler and VM trace
+// ============================================================================
+
+// The kdebug pid check cannot narrow these events to the target: exec gives the
+// process a new proc struct without the flag, and scheduler events ignore it
+// anyway. So time on CPU and faults are tallied per thread for the whole
+// system, then summed over the threads PET sampled, which kperf's PID filter
+// makes exactly the target's. A thread that lived less than one PET period
+// and was never sampled is missed.
+#define TRACE_MAX_CPUS  512
+#define TID_SLOTS       (1u << 17)
+
+typedef struct {
+    u64 tid;      // 0: empty slot
+    u64 on_cpu;   // mach absolute time units
+    u64 faults;
+    bool target;
+} tid_usage_t;
+
+typedef struct {
+    tid_usage_t *slots;
+    u64 cpu_tid[TRACE_MAX_CPUS];    // thread switched in last, per CPU
+    u64 cpu_since[TRACE_MAX_CPUS];  // and when; 0 until the first switch
+    bool full;
+} usage_tracker_t;
+
+static tid_usage_t *usage_get(usage_tracker_t *u, u64 tid) {
+    u64 h = (tid * 0x9E3779B97F4A7C15ull) & (TID_SLOTS - 1);
+    for (u64 i = 0; i < TID_SLOTS; i++) {
+        tid_usage_t *t = &u->slots[(h + i) & (TID_SLOTS - 1)];
+        if (t->tid == tid) return t;
+        if (t->tid == 0) {
+            t->tid = tid;
+            return t;
+        }
+    }
+    u->full = true;
+    return NULL;
+}
+
+static void usage_event(usage_tracker_t *u, const kd_buf *b) {
+    u32 id = b->debugid & KDBG_EVENTID_MASK;
+    tid_usage_t *t;
+
+    if (id == SCHED_SWITCH_EVENT || id == SCHED_HANDOFF_EVENT) {
+        u32 cpu = b->cpuid;
+        if (cpu >= TRACE_MAX_CPUS) return;
+        if (u->cpu_since[cpu] && u->cpu_tid[cpu] == b->arg5 &&
+            (t = usage_get(u, b->arg5)))
+            t->on_cpu += b->timestamp - u->cpu_since[cpu];
+        u->cpu_tid[cpu] = b->arg2;
+        u->cpu_since[cpu] = b->timestamp;
+    } else if (id == VM_FAULT_EVENT) {
+        if ((b->debugid & KDBG_FUNC_MASK) != DBG_FUNC_END && (t = usage_get(u, b->arg5)))
+            t->faults++;
+    } else if (id == KDBG_EVENTID(DBG_PERF, PERF_KPC, PERF_KPC_DATA_THREAD)) {
+        if ((t = usage_get(u, b->arg5))) t->target = true;
+    }
+}
+
+// Threads the target already has when counting starts are its own even if PET
+// never samples them. The one that matters is a launched command's thread
+// before exec: exec does its work, faults included, in that thread and then
+// carries on in a new one.
+#define PROC_PIDLISTTHREADIDS 28  // XNU's proc_info_private.h
+
+static void usage_mark_threads(usage_tracker_t *u, pid_t pid) {
+    u64 tids[1024];
+    int n = proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, 0, tids, sizeof(tids));
+    for (int i = 0; i < n / (int)sizeof(u64); i++) {
+        tid_usage_t *t = usage_get(u, tids[i]);
+        if (t) t->target = true;
+    }
+}
+
+static void usage_totals(const usage_tracker_t *u, u64 *task_clock_ns, u64 *faults) {
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    u64 ticks = 0;
+    *faults = 0;
+    for (u64 i = 0; i < TID_SLOTS; i++) {
+        if (!u->slots[i].target) continue;
+        ticks += u->slots[i].on_cpu;
+        *faults += u->slots[i].faults;
+    }
+    *task_clock_ns = (u64)((double)ticks * tb.numer / tb.denom);
 }
 
 // ============================================================================
@@ -832,18 +1002,31 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
         goto fail_early;
     }
 
-    // Filter to only PMC thread data
+    // Keep exactly four event IDs, the most the kernel matches: PMC thread
+    // data, the two kinds of context switch, and faults when they are counted
+    // (otherwise PMC data again). Fault records dominate a fault-heavy program's
+    // trace, which is why they are left out unless asked for.
     kd_regtype kdr = { 0 };
     kdr.type = KDBG_VALCHECK;
     kdr.value1 = KDBG_EVENTID(DBG_PERF, PERF_KPC, PERF_KPC_DATA_THREAD);
+    kdr.value2 = SCHED_SWITCH_EVENT;
+    kdr.value3 = SCHED_HANDOFF_EVENT;
+    kdr.value4 = state->count_faults ? VM_FAULT_EVENT : kdr.value1;
     if ((ret = kdebug_setreg(&kdr))) {
         fprintf(stderr, "Error: Failed to set kdebug filter: %d\n", ret);
         goto fail_early;
     }
-    if ((ret = kdebug_trace_enable(1))) {
-        fprintf(stderr, "Error: Failed to enable kdebug: %d\n", ret);
+    usage_tracker_t usage = { .slots = calloc(TID_SLOTS, sizeof(tid_usage_t)) };
+    if (!usage.slots) {
+        fprintf(stderr, "Error: Failed to allocate thread table\n");
         goto fail_early;
     }
+    if ((ret = kdebug_trace_enable(1))) {
+        fprintf(stderr, "Error: Failed to enable kdebug: %d\n", ret);
+        free(usage.slots);
+        goto fail_early;
+    }
+    usage_mark_threads(&usage, target_pid);
 
     // Counting: the controller may release its target now.
     control_ack(control);
@@ -863,11 +1046,13 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
 
     if (!buf_storage) {
         fprintf(stderr, "Error: Failed to allocate trace buffer\n");
+        free(usage.slots);
         goto cleanup;
     }
 
     usize total_raw_samples = 0;
     usize total_filtered_samples = 0;
+    bool wrapped = false;
 
     // Record start time
     struct timeval wall_start, wall_end;
@@ -915,14 +1100,16 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
             buf_capacity = new_capacity;
         }
 
-        // Read trace data
+        // Read trace data. A read clears the wrapped flag, so check it first.
         usize count = 0;
+        wrapped |= kdebug_wrapped();
         kdebug_trace_read(buf_cur, sizeof(kd_buf) * nbufs, &count);
         total_raw_samples += count;
 
-        // Filter for PMC thread data
+        // Tally the scheduler and VM events, and keep the PMC thread data
         kd_buf *write_ptr = buf_cur;
         for (kd_buf *buf = buf_cur, *end = buf_cur + count; buf < end; buf++) {
+            usage_event(&usage, buf);
             u32 debugid = buf->debugid;
             u32 cls = KDBG_EXTRACT_CLASS(debugid);
             u32 subcls = KDBG_EXTRACT_SUBCLASS(debugid);
@@ -992,6 +1179,13 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
 
     free(buf_storage);
 
+    usage_totals(&usage, &state->task_clock_ns, &state->page_faults);
+    free(usage.slots);
+    if (wrapped)
+        fprintf(stderr, "Warning: the kernel trace buffer wrapped; counts are low\n");
+    if (usage.full)
+        fprintf(stderr, "Warning: too many threads in the system to track task-clock\n");
+
     // Aggregate across all threads
     u64 total_counters[KPC_MAX_COUNTERS] = { 0 };
     int threads_with_data = 0;
@@ -1016,7 +1210,7 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
         fprintf(stderr, "Threads with valid data: %d\n", threads_with_data);
         fprintf(stderr, "Counter count: %u\n", state->counter_count);
         fprintf(stderr, "Counter map: ");
-        for (int i = 0; i < state->event_count; i++) {
+        for (int i = 0; i < state->pmc_count; i++) {
             fprintf(stderr, "%zu ", state->counter_map[i]);
         }
         fprintf(stderr, "\n");
@@ -1030,11 +1224,10 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
         }
     }
 
-    state->num_threads_seen = threads_with_data;
-
     // Map counter values to events
     for (int i = 0; i < state->event_count; i++) {
-        usize idx = state->counter_map[i];
+        if (state->events[i].kind != EVENT_PMC) continue;
+        usize idx = state->counter_map[state->events[i].pmc_index];
         state->events[i].value = total_counters[idx];
     }
 
@@ -1048,10 +1241,23 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
     timersub(&usage_end.ru_stime, &usage_start.ru_stime, &sys_diff);
 
     // RUSAGE_CHILDREN says nothing about a process we did not fork, so an
-    // attached run has no user/sys time, and perf stat -p prints none either.
+    // attached run has no user/sys time; perf stat -p prints no user/sys
+    // lines either, and its user_time and system_time events read 0.
     if (exit_kq < 0) {
         state->user_time_ns = user_diff.tv_sec * 1e9 + user_diff.tv_usec * 1e3;
         state->sys_time_ns = sys_diff.tv_sec * 1e9 + sys_diff.tv_usec * 1e3;
+    }
+
+    for (int i = 0; i < state->event_count; i++) {
+        configured_event_t *e = &state->events[i];
+        switch (e->kind) {
+            case EVENT_PMC:           break;
+            case EVENT_TASK_CLOCK:    e->value = state->task_clock_ns; break;
+            case EVENT_PAGE_FAULTS:   e->value = state->page_faults; break;
+            case EVENT_DURATION_TIME: e->value = (u64)state->wall_time_ns; break;
+            case EVENT_USER_TIME:     e->value = (u64)state->user_time_ns; break;
+            case EVENT_SYSTEM_TIME:   e->value = (u64)state->sys_time_ns; break;
+        }
     }
 
     // Measurement itself succeeded; whether the command did is the caller's
@@ -1163,21 +1369,18 @@ typedef enum {
     OUTPUT_JSON
 } output_format_t;
 
-// The metric perf prints beside a counter: GHz on cycles, insn per cycle on
-// instructions (tools/perf/util/stat-shadow.c, print_cycles and
-// print_instructions). `fmt` is perf's text format for the value; JSON ignores
-// it and always uses %f.
+// The metric perf 6.x prints beside a counter in text output: GHz on cycles,
+// insn per cycle on instructions (tools/perf/util/stat-shadow.c, print_cycles
+// and print_instructions). `fmt` is perf's format for the value. perf 7.0
+// prints no metric for events named with -e, in text or JSON, and mperf's JSON
+// follows 7.0.
 //
 // GHz divides by task-clock, which is CPU time, not wall time: an N-threaded
 // program accumulates cycles on N cores at once, so wall time would report N
-// times the real clock. getrusage's user+sys is our task-clock. It covers the
-// whole child tree while PET counts only the filtered PID, so a benchmark that
-// forks helpers reads a little low.
+// times the real clock. As in perf, it needs task-clock among the events.
 //
-// METRIC_UNAVAILABLE is perf's third case, where it names the unit but passes a
-// NULL format and a zero: print_metric_std() blanks the column, while
-// print_metric_json() gates on the unit alone and writes
-// "metric-value" : "0.000000". Both behaviours are reproduced, quirk included.
+// METRIC_UNAVAILABLE is perf's case where it names the unit but has no value,
+// and leaves the column blank.
 typedef enum {
     METRIC_NONE,         // perf prints no metric beside this counter
     METRIC_UNAVAILABLE,  // perf names the unit but has no value for it
@@ -1188,23 +1391,25 @@ static metric_status_t event_metric(pmc_state_t *state, const char *name,
                                     double *value_out, const char **fmt_out,
                                     const char **unit_out) {
     u64 cycles = 0, instructions = 0;
+    double task_clock_ns = 0;
     for (int i = 0; i < state->event_count; i++) {
         if (strcasecmp(state->events[i].name, "cycles") == 0)
             cycles = state->events[i].value;
         if (strcasecmp(state->events[i].name, "instructions") == 0)
             instructions = state->events[i].value;
+        if (state->events[i].kind == EVENT_TASK_CLOCK)
+            task_clock_ns = (double)state->events[i].value;
     }
 
-    double cpu_time_ns = state->user_time_ns + state->sys_time_ns;
     *value_out = 0.0;
 
     // perf guards this on `cycles && nsecs`.
     if (strcasecmp(name, "cycles") == 0) {
         *fmt_out = "%8.3f";
         *unit_out = "GHz";
-        if (cycles == 0 || cpu_time_ns <= 0) return METRIC_UNAVAILABLE;
+        if (cycles == 0 || task_clock_ns <= 0) return METRIC_UNAVAILABLE;
         // Cycles per nanosecond is already GHz.
-        *value_out = (double)cycles / cpu_time_ns;
+        *value_out = (double)cycles / task_clock_ns;
         return METRIC_OK;
     }
 
@@ -1222,8 +1427,7 @@ static metric_status_t event_metric(pmc_state_t *state, const char *name,
 }
 
 static void output_text(pmc_state_t *state, char **cmd, FILE *out) {
-    // Header mirrors perf stat's, with the thread count appended since PET
-    // aggregates across threads and perf has nothing equivalent to report.
+    // Header mirrors perf stat's
     if (state->attached_pid > 0) {
         fprintf(out, "\n Performance counter stats for process id '%d'",
                 state->attached_pid);
@@ -1233,15 +1437,15 @@ static void output_text(pmc_state_t *state, char **cmd, FILE *out) {
             fprintf(out, "%s%s", i ? " " : "", cmd[i]);
         fprintf(out, "'");
     }
-    if (state->num_threads_seen > 0) {
-        fprintf(out, " (%d thread%s)", state->num_threads_seen,
-                state->num_threads_seen == 1 ? "" : "s");
-    }
     fprintf(out, ":\n\n");
 
     for (int i = 0; i < state->event_count; i++) {
         configured_event_t *e = &state->events[i];
-        fprintf(out, "  %'20llu  %-24s", (unsigned long long)e->value, e->name);
+        // task-clock is perf's one msec event; the unit sits before the name
+        if (e->kind == EVENT_TASK_CLOCK)
+            fprintf(out, "  %'15.2f msec  %-24s", e->value / 1e6, e->name);
+        else
+            fprintf(out, "  %'20llu  %-24s", (unsigned long long)e->value, e->name);
 
         // perf lays the metric out as " # ", the value, a space, then the unit;
         // the widths come from its format strings, so the columns line up.
@@ -1265,53 +1469,40 @@ static void output_text(pmc_state_t *state, char **cmd, FILE *out) {
     }
 }
 
-// perf stat --json emits newline-delimited JSON: one object per counter, no
-// enclosing array, and -- because perf's print_footer() returns early for JSON
-// -- no elapsed/user/sys lines at all. The counter objects below are field for
-// field what perf writes, so a parser built for `perf stat --json` reads them
-// unchanged. The timing perf drops is appended afterwards as metric-only
-// objects, reusing the unit strings from perf's own text footer.
+// perf stat --json emits newline-delimited JSON: one object per event, no
+// enclosing array, no footer. The objects below are field for field what perf
+// 7.0 writes for events named with -e, so a parser built for
+// `perf stat --json` reads them unchanged:
 //
-// Two fields are constants here rather than measurements. PET keeps every
-// requested counter physically active for the whole run (there is no
-// multiplexing, hence the hard limit of 10 events), so the interval an event
-// was enabled is just the wall time, and the running percentage is always 100.
-static void json_metric_line(FILE *out, double value, const char *unit) {
-    fprintf(out, "{\"metric-value\" : \"%f\", \"metric-unit\" : \"%s\"}\n",
-            value, unit);
-}
-
+//   {"counter-value" : "0.770947", "unit" : "msec", "event" : "task-clock", "event-runtime" : 770947, "pcnt-running" : 100.00}
+//   {"counter-value" : "3650166.000000", "unit" : "", "event" : "cycles", "event-runtime" : 770947, "pcnt-running" : 100.00}
+//   {"counter-value" : "1002571504.000000", "unit" : "", "event" : "duration_time", "event-runtime" : 1, "pcnt-running" : 100.00}
+//
+// event-runtime is how long the counter ran, in ns, which for a per-task
+// counter is the task's time on CPU: task-clock. Tool events report 1. PET
+// keeps every requested counter physically active for the whole run (there is
+// no multiplexing, hence the hard limit of 10 events), so the running
+// percentage is always 100. The elapsed/user/sys times come only as the tool
+// events duration_time, user_time and system_time, as in perf.
 static void output_json(pmc_state_t *state, FILE *out) {
     for (int i = 0; i < state->event_count; i++) {
         configured_event_t *e = &state->events[i];
+        double value = (double)e->value;
+        const char *unit = "";
+        u64 runtime = state->task_clock_ns;
 
-        // perf quotes counter-value and prints it as a double; the empty unit
-        // is what perf emits for a plain hardware event.
-        fprintf(out, "{\"counter-value\" : \"%f\", \"unit\" : \"\", "
-                     "\"event\" : \"%s\"", (double)e->value, e->name);
-        fprintf(out, ", \"event-runtime\" : %llu, \"pcnt-running\" : 100.00",
-                (unsigned long long)state->wall_time_ns);
-
-        // perf carries a counter's derived metric on the counter's own object,
-        // including the zero it writes for a metric it could not compute.
-        double value;
-        const char *fmt, *unit;
-        if (event_metric(state, e->name, &value, &fmt, &unit) != METRIC_NONE) {
-            fprintf(out, ", \"metric-value\" : \"%f\", \"metric-unit\" : \"%s\"",
-                    value, unit);
+        if (e->kind == EVENT_TASK_CLOCK) {
+            value /= 1e6;
+            unit = "msec";
+        } else if (e->kind == EVENT_DURATION_TIME || e->kind == EVENT_USER_TIME ||
+                   e->kind == EVENT_SYSTEM_TIME) {
+            runtime = 1;
         }
-        fprintf(out, "}\n");
-    }
 
-    json_metric_line(out, state->wall_time_ns / 1e9, "seconds time elapsed");
-    if (state->attached_pid == 0) {
-        json_metric_line(out, state->user_time_ns / 1e9, "seconds user");
-        json_metric_line(out, state->sys_time_ns / 1e9, "seconds sys");
+        fprintf(out, "{\"counter-value\" : \"%f\", \"unit\" : \"%s\", \"event\" : \"%s\", "
+                     "\"event-runtime\" : %llu, \"pcnt-running\" : 100.00}\n",
+                value, unit, e->name, (unsigned long long)runtime);
     }
-
-    // No perf equivalent: PET aggregates across threads and perf has nothing to
-    // report here, so it rides along in the same shape the text header uses.
-    json_metric_line(out, (double)state->num_threads_seen, "threads measured");
 }
 
 // ============================================================================
@@ -1331,8 +1522,8 @@ static bool add_event_list(const char *spec, const char **events, int *count) {
 
     for (char *tok = strtok(copy, ","); tok; tok = strtok(NULL, ",")) {
         if (*tok == '\0') continue;
-        if (*count >= MAX_EVENTS) {
-            fprintf(stderr, "Too many events (max %d)\n", MAX_EVENTS);
+        if (*count >= MAX_LISTED) {
+            fprintf(stderr, "Too many events (max %d)\n", MAX_LISTED);
             return false;
         }
         events[(*count)++] = tok;
@@ -1348,9 +1539,10 @@ static void usage(const char *prog) {
         "\n"
         "Options:\n"
         "  -e, --event EVENT[,EVENT...]\n"
-        "                       Events to measure (can repeat, max 10 total)\n"
+        "                       Events to measure (can repeat; at most 10\n"
+        "                       hardware events, 16 in all)\n"
         "  -j, --json           Output newline-delimited JSON, one object per\n"
-        "                       counter, as perf stat --json does\n"
+        "                       event, as perf stat --json does\n"
         "  -o, --output FILE    Write the report to FILE instead of stderr\n"
         "      --append         Append to the -o file instead of truncating\n"
         "      --log-fd FD      Write the report to file descriptor FD\n"
@@ -1382,6 +1574,10 @@ static void usage(const char *prog) {
         "  l1d-cache-misses, l1i-cache-misses, llc-misses\n"
         "  ref-cycles (Intel only)\n"
         "  map-stalls, dispatch-stalls (Apple Silicon only)\n"
+        "\n"
+        "perf's software and tool events, from the kernel trace and the clock:\n"
+        "  task-clock, page-faults (or faults)\n"
+        "  duration_time, user_time, system_time\n"
         "\n"
         "Example:\n"
         "  sudo %s -e cycles -e instructions -- ./my_benchmark\n"
@@ -1469,7 +1665,7 @@ int main(int argc, char **argv) {
         {0, 0, 0, 0}
     };
 
-    const char *events[MAX_EVENTS];
+    const char *events[MAX_LISTED];
     int event_count = 0;
     output_format_t format = OUTPUT_TEXT;
     double sample_period_ms = 1.0;  // 1ms default
@@ -1616,6 +1812,12 @@ int main(int argc, char **argv) {
             pmc_cleanup(&state);
             return 1;
         }
+    }
+    // PET only reports threads it has counters for, and those threads are
+    // what task-clock and page-faults are summed over.
+    if (state.pmc_count == 0 && !pmc_add_counter(&state, "cycles", false)) {
+        pmc_cleanup(&state);
+        return 1;
     }
 
     if (!pmc_configure(&state)) {

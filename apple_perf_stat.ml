@@ -29,7 +29,6 @@ type measurement = {
   counters : counters;
   time : time_info;
   derived : derived_metrics;
-  threads_measured : int;
   exit_code : int;
 }
 
@@ -48,9 +47,9 @@ let set_tool_path path = tool_path := path
 (* JSON parsing - minimal implementation without external deps.
 
    The tool emits perf stat --json's newline-delimited JSON: one object per
-   line, with no enclosing array. Counter objects carry "event" and
-   "counter-value"; the timings and the thread count arrive as metric-only
-   objects, because perf writes no footer at all in JSON mode. *)
+   event, with no enclosing array and no footer. Each carries "event" and
+   "counter-value"; the timings arrive as perf's tool events, which [run]
+   always asks for. *)
 module Json_parse = struct
   (* Value of [key] within a single NDJSON line. Values are either quoted
      ("counter-value" : "123.000000") or bare ("event-runtime" : 4096); both
@@ -77,67 +76,64 @@ module Json_parse = struct
   let lines text =
     String.split_on_char '\n' text
     |> List.filter (fun l -> String.trim l <> "")
-
-  (* A metric is identified by its unit string, which is the one perf prints in
-     its text footer. Counter objects carry their own metric, so this also
-     finds "insn per cycle" on the instructions line. *)
-  let metric unit lines =
-    List.find_map
-      (fun line ->
-         match find_field "metric-unit" line with
-         | Some u when u = unit -> float_field "metric-value" line
-         | _ -> None)
-      lines
-
-  (* perf names a metric's unit even when it has no value for it, writing
-     "metric-value" : "0.000000", and mperf reproduces that. Neither a clock
-     speed nor an insn-per-cycle figure can genuinely be zero, so read a zero
-     as absent rather than passing it on as a measurement. *)
-  let computed_metric unit lines =
-    match metric unit lines with
-    | Some v when v > 0.0 -> Some v
-    | _ -> None
 end
 
-let parse_json_output output =
-  let lines = Json_parse.lines output in
+(* perf's tool events for the run's own times, in ns *)
+let time_events = ["duration_time"; "user_time"; "system_time"]
 
-  let counters =
+let parse_json_output output =
+  let events =
     List.filter_map
       (fun line ->
          match
            Json_parse.find_field "event" line,
            Json_parse.float_field "counter-value" line
          with
-         | Some name, Some value -> Some (name, Int64.of_float value)
+         | Some name, Some value ->
+           (* task-clock is the one event perf reports in msec *)
+           let scale =
+             if Json_parse.find_field "unit" line = Some "msec" then 1e6 else 1.0
+           in
+           Some (name, value *. scale)
          | _ -> None)
-      lines
+      (Json_parse.lines output)
   in
 
-  let seconds unit =
-    match Json_parse.metric unit lines with Some s -> s *. 1e9 | None -> 0.0
-  in
+  let ns name = Option.value (List.assoc_opt name events) ~default:0.0 in
   let time = {
-    wall_ns = seconds "seconds time elapsed";
-    user_ns = seconds "seconds user";
-    sys_ns = seconds "seconds sys";
+    wall_ns = ns "duration_time";
+    user_ns = ns "user_time";
+    sys_ns = ns "system_time";
   } in
 
-  (* perf reports insn per cycle only, leaving the reciprocal to the caller. *)
-  let ipc = Json_parse.computed_metric "insn per cycle" lines in
+  let counters =
+    events
+    |> List.filter (fun (name, _) -> not (List.mem name time_events))
+    |> List.map (fun (name, value) -> (name, Int64.of_float value))
+  in
+
+  (* perf 7.0 prints no metrics for events named with -e, so derive them. *)
+  let count name =
+    match List.assoc_opt name counters with
+    | Some v when v > 0L -> Some (Int64.to_float v)
+    | _ -> None
+  in
+  let cpu_ns = time.user_ns +. time.sys_ns in
+  let ipc =
+    match count "cycles", count "instructions" with
+    | Some c, Some i -> Some (i /. c)
+    | _ -> None
+  in
   let derived = {
     ipc;
-    cpi = (match ipc with Some i when i > 0.0 -> Some (1.0 /. i) | _ -> None);
-    ghz = Json_parse.computed_metric "GHz" lines;
+    cpi = Option.map (fun i -> 1.0 /. i) ipc;
+    ghz =
+      (match count "cycles" with
+       | Some c when cpu_ns > 0.0 -> Some (c /. cpu_ns)
+       | _ -> None);
   } in
 
-  let threads_measured =
-    match Json_parse.metric "threads measured" lines with
-    | Some t -> int_of_float t
-    | None -> 0
-  in
-
-  { counters; time; derived; threads_measured; exit_code = 0 }
+  { counters; time; derived; exit_code = 0 }
 
 let run ?(events = ["cycles"; "instructions"]) ?(sample_period_ms = 1.0) command =
   (* Check if we're root *)
@@ -147,10 +143,10 @@ let run ?(events = ["cycles"; "instructions"]) ?(sample_period_ms = 1.0) command
     Error Tool_not_found
   else begin
     (* Build command line *)
-    let event_args = 
-      events 
-      |> List.map (fun e -> ["-e"; e]) 
-      |> List.flatten 
+    let event_args =
+      events @ List.filter (fun e -> not (List.mem e events)) time_events
+      |> List.map (fun e -> ["-e"; e])
+      |> List.flatten
     in
     let period_args = ["-P"; Printf.sprintf "%.1f" sample_period_ms] in
 
@@ -188,7 +184,7 @@ let run ?(events = ["cycles"; "instructions"]) ?(sample_period_ms = 1.0) command
     else
       try
         let result = parse_json_output output in
-        if result.threads_measured = 0 then
+        if List.for_all (fun (_, v) -> v = 0L) result.counters then
           Error (No_samples "No thread samples collected - program may have been too short")
         else
           Ok { result with exit_code }
@@ -217,9 +213,7 @@ let wall_time_seconds result =
 
 let pp_result fmt result =
   Format.fprintf fmt "@[<v>";
-  Format.fprintf fmt "Counters (%d thread%s):@." 
-    result.threads_measured 
-    (if result.threads_measured = 1 then "" else "s");
+  Format.fprintf fmt "Counters:@.";
   List.iter (fun (name, value) ->
     Format.fprintf fmt "  %s: %Ld@." name value
   ) result.counters;
