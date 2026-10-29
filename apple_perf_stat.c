@@ -730,6 +730,7 @@ static void profiling_cleanup(void) {
 // real wait(2) status; it is false when the tool failed before the command
 // could be waited for, and the caller then reports a tool error instead.
 typedef struct {
+    bool counted;  // counting started, so there is a report to write
     bool reaped;
     int status;
 } child_outcome_t;
@@ -1079,6 +1080,11 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
     u32 actionid = 1;
     u32 timerid = 1;
 
+    // A killed mperf leaves sampling on, and kperf cannot be reconfigured
+    // while it is. perf has no such problem: the kernel drops its events.
+    kperf_sample_set(0);
+    kperf_lightweight_pet_set(0);
+
     if ((ret = kperf_action_count_set(KPERF_ACTION_MAX))) {
         fprintf(stderr, "Error: Failed to set action count: %d\n", ret);
         goto fail_early;
@@ -1162,6 +1168,7 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
     usage_mark_threads(&usage, target_pid);
 
     // Counting: the controller may release its target now.
+    outcome->counted = true;
     control_ack(control);
 
     // NOW let the child process start executing
@@ -1451,7 +1458,12 @@ cleanup:
     return success;
 
 fail_early:
-    if (sync_fd >= 0) close(sync_fd);
+    // As perf stat does when no event can be counted, the command never runs.
+    if (sync_fd >= 0) {
+        kill(target_pid, SIGKILL);
+        close(sync_fd);
+        waitpid(target_pid, NULL, 0);
+    }
     profiling_cleanup();
     return false;
 }
@@ -2028,7 +2040,7 @@ int main(int argc, char **argv) {
     }
 
     double sample_period_sec = sample_period_ms / 1000.0;
-    child_outcome_t outcome = { false, 0 };
+    child_outcome_t outcome = { false, false, 0 };
     char pid_label[32];
     char *attach_argv[] = { pid_label, NULL };
     char **cmd_argv = &argv[optind];
@@ -2081,7 +2093,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (format == OUTPUT_JSON) {
+    // Like perf, a run that never counted leaves no report, only the error.
+    if (!outcome.counted) {
+        exit_code = 1;
+    } else if (format == OUTPUT_JSON) {
         output_json(&state, out);
     } else {
         output_text(&state, cmd_argv, out);
