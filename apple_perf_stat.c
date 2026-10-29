@@ -19,6 +19,13 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/kdebug.h>
+#include <mach/mach_time.h>
+#include <sys/event.h>
+#include <sys/proc_info.h>
+#include <libproc.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <pwd.h>
 #include <getopt.h>
 #include <signal.h>
 #include <errno.h>
@@ -194,6 +201,25 @@ typedef struct {
 #define PERF_KPC              6
 #define PERF_KPC_DATA_THREAD  8
 
+// task-clock and page-faults come from the same trace. A context switch is
+// logged by the outgoing thread (arg5) and names the incoming one (arg2);
+// stack_handoff() switches without a MACH_SCHED record, so it is needed too.
+// A fault is logged by the faulting thread.
+#define SCHED_SWITCH_EVENT    MACHDBG_CODE(DBG_MACH_SCHED, MACH_SCHED)
+#define SCHED_HANDOFF_EVENT   MACHDBG_CODE(DBG_MACH_SCHED, MACH_STACK_HANDOFF)
+#define VM_FAULT_EVENT        MACHDBG_CODE(DBG_MACH_VM, 2)  // vm_fault()
+
+// KERN_KDGETBUF's reply (kbufinfo_t in XNU)
+typedef struct {
+    int nkdbufs;
+    int nolog;
+    unsigned int flags;
+    int nkdthreads;
+    int bufid;
+} kd_bufinfo_t;
+
+#define KDBG_WRAPPED 0x0008
+
 // ============================================================================
 // Framework Loading
 // ============================================================================
@@ -316,6 +342,14 @@ static int kdebug_trace_read(void *buf, usize len, usize *count) {
     return 0;
 }
 
+// The kernel overwrote events we had not read yet.
+static bool kdebug_wrapped(void) {
+    kd_bufinfo_t info = { 0 };
+    usize size = sizeof(info);
+    int mib[3] = { CTL_KERN, KERN_KDEBUG, KERN_KDGETBUF };
+    return sysctl(mib, 3, &info, &size, NULL, 0) == 0 && (info.flags & KDBG_WRAPPED);
+}
+
 // Lightweight PET mode (not in framework, use sysctl directly)
 static int kperf_lightweight_pet_set(u32 enabled) {
     return sysctlbyname("kperf.lightweight_pet", NULL, NULL, &enabled, 4);
@@ -373,11 +407,41 @@ static kpep_event *find_event(kpep_db *db, const char *name) {
 // PMC State
 // ============================================================================
 
-#define MAX_EVENTS 10
+#define MAX_EVENTS 10   // hardware counters
+#define MAX_LISTED 16   // everything -e may name, software and tool events too
+
+// perf's software events that mperf derives from the kernel trace, and its
+// tool events, which are just the run's own times. Anything else is a PMC.
+typedef enum {
+    EVENT_PMC,
+    EVENT_TASK_CLOCK,     // ns on CPU, reported in msec
+    EVENT_PAGE_FAULTS,
+    EVENT_DURATION_TIME,  // the rest are ns
+    EVENT_USER_TIME,
+    EVENT_SYSTEM_TIME
+} event_kind_t;
+
+static const struct { const char *name; event_kind_t kind; } named_events[] = {
+    { "task-clock",    EVENT_TASK_CLOCK },
+    { "page-faults",   EVENT_PAGE_FAULTS },
+    { "faults",        EVENT_PAGE_FAULTS },  // perf's alias
+    { "duration_time", EVENT_DURATION_TIME },
+    { "user_time",     EVENT_USER_TIME },
+    { "system_time",   EVENT_SYSTEM_TIME },
+    { NULL, EVENT_PMC }
+};
+
+static event_kind_t event_kind(const char *name) {
+    for (int i = 0; named_events[i].name; i++)
+        if (strcmp(name, named_events[i].name) == 0) return named_events[i].kind;
+    return EVENT_PMC;
+}
 
 typedef struct {
     const char *name;
-    kpep_event *event;
+    event_kind_t kind;
+    kpep_event *event;   // EVENT_PMC only
+    int pmc_index;       // EVENT_PMC only: position in the kpep config
     u64 value;
 } configured_event_t;
 
@@ -390,15 +454,19 @@ typedef struct {
     kpc_config_t regs[KPC_MAX_COUNTERS];
     usize counter_map[KPC_MAX_COUNTERS];
 
-    configured_event_t events[MAX_EVENTS];
+    configured_event_t events[MAX_LISTED];
     int event_count;
+    int pmc_count;
+    bool count_faults;   // page-faults was asked for
 
     double wall_time_ns;
     double user_time_ns;
     double sys_time_ns;
+    u64 task_clock_ns;   // always measured: it is every counter's event-runtime
+    u64 page_faults;
 
-    // PET-specific
-    int num_threads_seen;
+    // -p target; 0 when mperf launched the command itself
+    pid_t attached_pid;
 } pmc_state_t;
 
 static bool pmc_init(pmc_state_t *state) {
@@ -428,9 +496,11 @@ static bool pmc_init(pmc_state_t *state) {
     return true;
 }
 
-static bool pmc_add_event(pmc_state_t *state, const char *name) {
-    if (state->event_count >= MAX_EVENTS) {
-        fprintf(stderr, "Error: Too many events (max %d)\n", MAX_EVENTS);
+// Adds a hardware counter to the kpep config; `listed` says whether it is
+// reported or only there so that PET has something to sample.
+static bool pmc_add_counter(pmc_state_t *state, const char *name, bool listed) {
+    if (state->pmc_count >= MAX_EVENTS) {
+        fprintf(stderr, "Error: Too many hardware events (max %d)\n", MAX_EVENTS);
         return false;
     }
 
@@ -449,10 +519,30 @@ static bool pmc_add_event(pmc_state_t *state, const char *name) {
         return false;
     }
 
-    state->events[state->event_count].name = name;
-    state->events[state->event_count].event = ev;
-    state->event_count++;
+    if (listed) {
+        configured_event_t *e = &state->events[state->event_count++];
+        e->name = name;
+        e->kind = EVENT_PMC;
+        e->event = ev;
+        e->pmc_index = state->pmc_count;
+    }
+    state->pmc_count++;
+    return true;
+}
 
+static bool pmc_add_event(pmc_state_t *state, const char *name) {
+    if (state->event_count >= MAX_LISTED) {
+        fprintf(stderr, "Error: Too many events (max %d)\n", MAX_LISTED);
+        return false;
+    }
+
+    event_kind_t kind = event_kind(name);
+    if (kind == EVENT_PMC) return pmc_add_counter(state, name, true);
+
+    configured_event_t *e = &state->events[state->event_count++];
+    e->name = name;
+    e->kind = kind;
+    if (kind == EVENT_PAGE_FAULTS) state->count_faults = true;
     return true;
 }
 
@@ -524,6 +614,95 @@ static thread_data_t *tracker_get_or_create(thread_tracker_t *tracker, u32 tid) 
 }
 
 // ============================================================================
+// task-clock and page-faults from the scheduler and VM trace
+// ============================================================================
+
+// The kdebug pid check cannot narrow these events to the target: exec gives the
+// process a new proc struct without the flag, and scheduler events ignore it
+// anyway. So time on CPU and faults are tallied per thread for the whole
+// system, then summed over the threads PET sampled, which kperf's PID filter
+// makes exactly the target's. A thread that lived less than one PET period
+// and was never sampled is missed.
+#define TRACE_MAX_CPUS  512
+#define TID_SLOTS       (1u << 17)
+
+typedef struct {
+    u64 tid;      // 0: empty slot
+    u64 on_cpu;   // mach absolute time units
+    u64 faults;
+    bool target;
+} tid_usage_t;
+
+typedef struct {
+    tid_usage_t *slots;
+    u64 cpu_tid[TRACE_MAX_CPUS];    // thread switched in last, per CPU
+    u64 cpu_since[TRACE_MAX_CPUS];  // and when; 0 until the first switch
+    bool full;
+} usage_tracker_t;
+
+static tid_usage_t *usage_get(usage_tracker_t *u, u64 tid) {
+    u64 h = (tid * 0x9E3779B97F4A7C15ull) & (TID_SLOTS - 1);
+    for (u64 i = 0; i < TID_SLOTS; i++) {
+        tid_usage_t *t = &u->slots[(h + i) & (TID_SLOTS - 1)];
+        if (t->tid == tid) return t;
+        if (t->tid == 0) {
+            t->tid = tid;
+            return t;
+        }
+    }
+    u->full = true;
+    return NULL;
+}
+
+static void usage_event(usage_tracker_t *u, const kd_buf *b) {
+    u32 id = b->debugid & KDBG_EVENTID_MASK;
+    tid_usage_t *t;
+
+    if (id == SCHED_SWITCH_EVENT || id == SCHED_HANDOFF_EVENT) {
+        u32 cpu = b->cpuid;
+        if (cpu >= TRACE_MAX_CPUS) return;
+        if (u->cpu_since[cpu] && u->cpu_tid[cpu] == b->arg5 &&
+            (t = usage_get(u, b->arg5)))
+            t->on_cpu += b->timestamp - u->cpu_since[cpu];
+        u->cpu_tid[cpu] = b->arg2;
+        u->cpu_since[cpu] = b->timestamp;
+    } else if (id == VM_FAULT_EVENT) {
+        if ((b->debugid & KDBG_FUNC_MASK) != DBG_FUNC_END && (t = usage_get(u, b->arg5)))
+            t->faults++;
+    } else if (id == KDBG_EVENTID(DBG_PERF, PERF_KPC, PERF_KPC_DATA_THREAD)) {
+        if ((t = usage_get(u, b->arg5))) t->target = true;
+    }
+}
+
+// Threads the target already has when counting starts are its own even if PET
+// never samples them. The one that matters is a launched command's thread
+// before exec: exec does its work, faults included, in that thread and then
+// carries on in a new one.
+#define PROC_PIDLISTTHREADIDS 28  // XNU's proc_info_private.h
+
+static void usage_mark_threads(usage_tracker_t *u, pid_t pid) {
+    u64 tids[1024];
+    int n = proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, 0, tids, sizeof(tids));
+    for (int i = 0; i < n / (int)sizeof(u64); i++) {
+        tid_usage_t *t = usage_get(u, tids[i]);
+        if (t) t->target = true;
+    }
+}
+
+static void usage_totals(const usage_tracker_t *u, u64 *task_clock_ns, u64 *faults) {
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    u64 ticks = 0;
+    *faults = 0;
+    for (u64 i = 0; i < TID_SLOTS; i++) {
+        if (!u->slots[i].target) continue;
+        ticks += u->slots[i].on_cpu;
+        *faults += u->slots[i].faults;
+    }
+    *task_clock_ns = (u64)((double)ticks * tb.numer / tb.denom);
+}
+
+// ============================================================================
 // Signal handling for clean shutdown
 // ============================================================================
 
@@ -545,23 +724,213 @@ static void profiling_cleanup(void) {
     kpc_force_all_ctrs_set(0);
 }
 
-// ============================================================================
-// PET-based measurement (accurate, multi-threaded)
-// ============================================================================
-
 // How the measured command finished. `reaped` says whether `status` holds a
 // real wait(2) status; it is false when the tool failed before the command
 // could be waited for, and the caller then reports a tool error instead.
 typedef struct {
+    bool counted;  // counting started, so there is a report to write
     bool reaped;
     int status;
 } child_outcome_t;
 
+// ============================================================================
+// Privileges
+// ============================================================================
+
+// Who mperf runs on behalf of. Programming the PMU needs root, nothing else
+// does: the measured command, and every file opened by name, belong to the
+// user who invoked mperf, whether root came from sudo or from a setuid install.
+typedef struct {
+    bool drop;         // false when root itself ran mperf, without sudo
+    bool setuid;       // setuid install: the real uid is the invoking user
+    uid_t uid;
+    gid_t gid;
+    const char *name;  // sudo only, for initgroups(); NULL means no lookup
+} invoker_t;
+
+static invoker_t g_invoker;
+
+static bool parse_id(const char *s, unsigned long *out) {
+    char *end;
+    errno = 0;
+    *out = strtoul(s, &end, 10);
+    return *s && !*end && !errno;
+}
+
+static bool invoker_init(void) {
+    if (getuid() != geteuid()) {
+        g_invoker = (invoker_t){ .drop = true, .setuid = true,
+                                 .uid = getuid(), .gid = getgid() };
+        return true;
+    }
+
+    // Only trust SUDO_* when the real uid is root. Under a setuid install the
+    // caller controls the environment, and that case was settled above.
+    const char *su = getenv("SUDO_UID"), *sg = getenv("SUDO_GID");
+    if (getuid() != 0 || !su || !sg) return true;
+
+    unsigned long uid, gid;
+    if (!parse_id(su, &uid) || !parse_id(sg, &gid)) {
+        fprintf(stderr, "Error: malformed SUDO_UID/SUDO_GID\n");
+        return false;
+    }
+    struct passwd *pw = getpwuid((uid_t)uid);
+    g_invoker = (invoker_t){ .drop = uid != 0, .uid = (uid_t)uid, .gid = (gid_t)gid,
+                             .name = pw ? strdup(pw->pw_name) : NULL };
+    return true;
+}
+
+// Permanently become the invoking user; for the child, just before exec.
+static bool drop_privileges(void) {
+    if (!g_invoker.drop) return true;
+
+    // A setuid process already has the user's supplementary groups; under sudo
+    // they are root's and have to be replaced.
+    if (!g_invoker.setuid) {
+        int rc = g_invoker.name ? initgroups(g_invoker.name, (int)g_invoker.gid)
+                                : setgroups(1, &g_invoker.gid);
+        if (rc != 0) return false;
+    }
+    if (setgid(g_invoker.gid) != 0 || setuid(g_invoker.uid) != 0) return false;
+    // setuid() as root sets the saved uid too; make sure root is really gone.
+    return setuid(0) != 0 && getuid() == g_invoker.uid && geteuid() == g_invoker.uid;
+}
+
+// open(2) a path the invoking user named, with the user's permissions, so a
+// setuid mperf cannot be used to create or truncate files the user could not.
+// Only the effective ids change, so root comes back afterwards. Under sudo the
+// supplementary groups stay root's, which only matters to someone who is root.
+static int open_as_invoker(const char *path, int flags, mode_t mode) {
+    if (!g_invoker.drop) return open(path, flags, mode);
+
+    gid_t egid = getegid();
+    if (setegid(g_invoker.gid) != 0) return -1;
+    if (seteuid(g_invoker.uid) != 0) {
+        int err = errno;
+        setegid(egid);
+        errno = err;
+        return -1;
+    }
+    int fd = open(path, flags, mode);
+    int err = errno;
+    if (seteuid(0) != 0 || setegid(egid) != 0) {
+        // Without root back, teardown of the kernel state would fail later.
+        perror("Error: cannot regain root after opening a file");
+        exit(1);
+    }
+    errno = err;
+    return fd;
+}
+
+// -p is refused for processes the invoking user could not ptrace themselves,
+// mirroring perf's same-uid rule. Root, including via sudo, may attach anywhere.
+static bool may_attach(pid_t pid) {
+    struct proc_bsdinfo bi;
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi)) != (int)sizeof(bi)) {
+        fprintf(stderr, "Error: no such process: %d\n", pid);
+        return false;
+    }
+    if (!g_invoker.setuid) return true;
+    if (bi.pbi_uid != g_invoker.uid || bi.pbi_ruid != g_invoker.uid ||
+        bi.pbi_svuid != g_invoker.uid || (bi.pbi_flags & PROC_FLAG_PSUGID)) {
+        fprintf(stderr, "Error: process %d does not belong to you\n", pid);
+        return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Control protocol (perf stat --delay -1 --control)
+// ============================================================================
+
+// Enough of perf's --control protocol for an armed start: block for "enable",
+// set up, then answer "ack\n" once counting. A harness that already drives
+// `perf stat --delay -1 --control fifo:ctl,ack` drives mperf the same way.
+// "ping" is acknowledged as perf does; anything else is reported and ignored.
+//
+// Unlike perf, a command mperf launches is held until counting starts rather
+// than started straight away with events disabled: threads it creates before
+// PET is armed would never be counted.
+typedef struct {
+    int ctl_fd;   // -1 when there is no --control
+    int ack_fd;   // -1 when --control named no ack channel
+} control_t;
+
+static bool parse_control(const char *spec, control_t *c) {
+    c->ctl_fd = c->ack_fd = -1;
+    char *copy = strdup(spec);
+    if (!copy) return false;
+    char *ack = strchr(copy, ',');
+    if (ack) *ack++ = '\0';
+
+    bool ok = false;
+    if (strncmp(copy, "fifo:", 5) == 0) {
+        // O_RDWR, as perf does: never blocks, and the fifo never reports EOF.
+        c->ctl_fd = open_as_invoker(copy + 5, O_RDWR | O_CLOEXEC, 0);
+        c->ack_fd = ack ? open_as_invoker(ack, O_WRONLY | O_CLOEXEC, 0) : -1;
+        ok = c->ctl_fd >= 0 && (!ack || c->ack_fd >= 0);
+        if (!ok) fprintf(stderr, "Error: cannot open --control fifo: %s\n", strerror(errno));
+    } else if (strncmp(copy, "fd:", 3) == 0) {
+        unsigned long ctl, ackfd = 0;
+        ok = parse_id(copy + 3, &ctl) && (!ack || parse_id(ack, &ackfd));
+        c->ctl_fd = (int)ctl;
+        c->ack_fd = ack ? (int)ackfd : -1;
+        if (!ok) fprintf(stderr, "Error: bad --control fd spec: %s\n", spec);
+    } else {
+        fprintf(stderr, "Error: --control takes fifo:CTL[,ACK] or fd:CTL[,ACK]\n");
+    }
+    free(copy);
+    return ok;
+}
+
+static void control_ack(const control_t *c) {
+    if (c->ack_fd >= 0 && write(c->ack_fd, "ack\n", 4) != 4)
+        perror("Warning: cannot write control ack");
+}
+
+static bool control_wait_enable(const control_t *c) {
+    char buf[128];
+    usize len = 0;
+    for (;;) {
+        ssize_t n = read(c->ctl_fd, buf + len, sizeof(buf) - 1 - len);
+        if (n < 0 && errno == EINTR && !g_interrupted) continue;
+        if (n <= 0) {
+            fprintf(stderr, "Error: control channel closed before \"enable\"\n");
+            return false;
+        }
+        len += (usize)n;
+        buf[len] = '\0';
+
+        char *nl;
+        while ((nl = memchr(buf, '\n', len))) {
+            *nl = '\0';
+            if (strcmp(buf, "enable") == 0) return true;
+            if (strcmp(buf, "ping") == 0) control_ack(c);
+            else fprintf(stderr, "Warning: ignoring control command \"%s\"\n", buf);
+            len -= (usize)(nl + 1 - buf);
+            memmove(buf, nl + 1, len);
+            buf[len] = '\0';
+        }
+        if (len == sizeof(buf) - 1) len = 0;  // an overlong line: drop it
+    }
+}
+
+// ============================================================================
+// PET-based measurement (accurate, multi-threaded)
+// ============================================================================
+
+// `exit_kq` is set in attach mode (-p): the target is not our child, so its
+// exit is watched through kqueue, which also fires while it is still an
+// unreaped zombie of whoever does own it.
 static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
                          double sample_period_sec, bool verbose, int sync_fd,
+                         int exit_kq, const control_t *control,
                          child_outcome_t *outcome) {
     bool success = false;
     int ret;
+
+    if (control->ctl_fd >= 0 && !control_wait_enable(control))
+        goto fail_early;
 
     // Start counting
     if (kpc_set_counting(state->classes) != 0 ||
@@ -577,6 +946,11 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
     // Set up kperf actions and timers
     u32 actionid = 1;
     u32 timerid = 1;
+
+    // A killed mperf leaves sampling on, and kperf cannot be reconfigured
+    // while it is. perf has no such problem: the kernel drops its events.
+    kperf_sample_set(0);
+    kperf_lightweight_pet_set(0);
 
     if ((ret = kperf_action_count_set(KPERF_ACTION_MAX))) {
         fprintf(stderr, "Error: Failed to set action count: %d\n", ret);
@@ -634,18 +1008,35 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
         goto fail_early;
     }
 
-    // Filter to only PMC thread data
+    // Keep exactly four event IDs, the most the kernel matches: PMC thread
+    // data, the two kinds of context switch, and faults when they are counted
+    // (otherwise PMC data again). Fault records dominate a fault-heavy program's
+    // trace, which is why they are left out unless asked for.
     kd_regtype kdr = { 0 };
     kdr.type = KDBG_VALCHECK;
     kdr.value1 = KDBG_EVENTID(DBG_PERF, PERF_KPC, PERF_KPC_DATA_THREAD);
+    kdr.value2 = SCHED_SWITCH_EVENT;
+    kdr.value3 = SCHED_HANDOFF_EVENT;
+    kdr.value4 = state->count_faults ? VM_FAULT_EVENT : kdr.value1;
     if ((ret = kdebug_setreg(&kdr))) {
         fprintf(stderr, "Error: Failed to set kdebug filter: %d\n", ret);
         goto fail_early;
     }
-    if ((ret = kdebug_trace_enable(1))) {
-        fprintf(stderr, "Error: Failed to enable kdebug: %d\n", ret);
+    usage_tracker_t usage = { .slots = calloc(TID_SLOTS, sizeof(tid_usage_t)) };
+    if (!usage.slots) {
+        fprintf(stderr, "Error: Failed to allocate thread table\n");
         goto fail_early;
     }
+    if ((ret = kdebug_trace_enable(1))) {
+        fprintf(stderr, "Error: Failed to enable kdebug: %d\n", ret);
+        free(usage.slots);
+        goto fail_early;
+    }
+    usage_mark_threads(&usage, target_pid);
+
+    // Counting: the controller may release its target now.
+    outcome->counted = true;
+    control_ack(control);
 
     // NOW let the child process start executing
     // Closing the write end of the pipe unblocks the child's read()
@@ -662,11 +1053,13 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
 
     if (!buf_storage) {
         fprintf(stderr, "Error: Failed to allocate trace buffer\n");
+        free(usage.slots);
         goto cleanup;
     }
 
     usize total_raw_samples = 0;
     usize total_filtered_samples = 0;
+    bool wrapped = false;
 
     // Record start time
     struct timeval wall_start, wall_end;
@@ -681,8 +1074,17 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
 
         if (g_interrupted) break;
 
-        // Check if child exited
-        pid_t result = waitpid(target_pid, &status, WNOHANG);
+        // Check if child exited. An attached target's status belongs to its
+        // own parent; perf stat -p reports 0 for it, and so do we.
+        pid_t result;
+        if (exit_kq >= 0) {
+            struct kevent ev;
+            struct timespec zero = { 0, 0 };
+            int n = kevent(exit_kq, NULL, 0, &ev, 1, &zero);
+            result = n > 0 ? target_pid : n;
+        } else {
+            result = waitpid(target_pid, &status, WNOHANG);
+        }
         if (result == -1 && errno != EINTR) break;
         if (result == target_pid) {
             outcome->reaped = true;
@@ -705,14 +1107,16 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
             buf_capacity = new_capacity;
         }
 
-        // Read trace data
+        // Read trace data. A read clears the wrapped flag, so check it first.
         usize count = 0;
+        wrapped |= kdebug_wrapped();
         kdebug_trace_read(buf_cur, sizeof(kd_buf) * nbufs, &count);
         total_raw_samples += count;
 
-        // Filter for PMC thread data
+        // Tally the scheduler and VM events, and keep the PMC thread data
         kd_buf *write_ptr = buf_cur;
         for (kd_buf *buf = buf_cur, *end = buf_cur + count; buf < end; buf++) {
+            usage_event(&usage, buf);
             u32 debugid = buf->debugid;
             u32 cls = KDBG_EXTRACT_CLASS(debugid);
             u32 subcls = KDBG_EXTRACT_SUBCLASS(debugid);
@@ -782,6 +1186,13 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
 
     free(buf_storage);
 
+    usage_totals(&usage, &state->task_clock_ns, &state->page_faults);
+    free(usage.slots);
+    if (wrapped)
+        fprintf(stderr, "Warning: the kernel trace buffer wrapped; counts are low\n");
+    if (usage.full)
+        fprintf(stderr, "Warning: too many threads in the system to track task-clock\n");
+
     // Aggregate across all threads
     u64 total_counters[KPC_MAX_COUNTERS] = { 0 };
     int threads_with_data = 0;
@@ -806,7 +1217,7 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
         fprintf(stderr, "Threads with valid data: %d\n", threads_with_data);
         fprintf(stderr, "Counter count: %u\n", state->counter_count);
         fprintf(stderr, "Counter map: ");
-        for (int i = 0; i < state->event_count; i++) {
+        for (int i = 0; i < state->pmc_count; i++) {
             fprintf(stderr, "%zu ", state->counter_map[i]);
         }
         fprintf(stderr, "\n");
@@ -820,11 +1231,10 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
         }
     }
 
-    state->num_threads_seen = threads_with_data;
-
     // Map counter values to events
     for (int i = 0; i < state->event_count; i++) {
-        usize idx = state->counter_map[i];
+        if (state->events[i].kind != EVENT_PMC) continue;
+        usize idx = state->counter_map[state->events[i].pmc_index];
         state->events[i].value = total_counters[idx];
     }
 
@@ -837,8 +1247,25 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
     timersub(&usage_end.ru_utime, &usage_start.ru_utime, &user_diff);
     timersub(&usage_end.ru_stime, &usage_start.ru_stime, &sys_diff);
 
-    state->user_time_ns = user_diff.tv_sec * 1e9 + user_diff.tv_usec * 1e3;
-    state->sys_time_ns = sys_diff.tv_sec * 1e9 + sys_diff.tv_usec * 1e3;
+    // RUSAGE_CHILDREN says nothing about a process we did not fork, so an
+    // attached run has no user/sys time; perf stat -p prints no user/sys
+    // lines either, and its user_time and system_time events read 0.
+    if (exit_kq < 0) {
+        state->user_time_ns = user_diff.tv_sec * 1e9 + user_diff.tv_usec * 1e3;
+        state->sys_time_ns = sys_diff.tv_sec * 1e9 + sys_diff.tv_usec * 1e3;
+    }
+
+    for (int i = 0; i < state->event_count; i++) {
+        configured_event_t *e = &state->events[i];
+        switch (e->kind) {
+            case EVENT_PMC:           break;
+            case EVENT_TASK_CLOCK:    e->value = state->task_clock_ns; break;
+            case EVENT_PAGE_FAULTS:   e->value = state->page_faults; break;
+            case EVENT_DURATION_TIME: e->value = (u64)state->wall_time_ns; break;
+            case EVENT_USER_TIME:     e->value = (u64)state->user_time_ns; break;
+            case EVENT_SYSTEM_TIME:   e->value = (u64)state->sys_time_ns; break;
+        }
+    }
 
     // Measurement itself succeeded; whether the command did is the caller's
     // business, and is reported through the exit status rather than folded in.
@@ -849,13 +1276,32 @@ cleanup:
     return success;
 
 fail_early:
-    if (sync_fd >= 0) close(sync_fd);
+    // As perf stat does when no event can be counted, the command never runs.
+    if (sync_fd >= 0) {
+        kill(target_pid, SIGKILL);
+        close(sync_fd);
+        waitpid(target_pid, NULL, 0);
+    }
     profiling_cleanup();
     return false;
 }
 
+// SIGTERM is how a harness stops a tool; it gets the same cleanup as Ctrl+C,
+// or the kernel would be left with PET sampling and the counters configured.
+static void install_stop_handlers(struct sigaction old[2]) {
+    struct sigaction sa = { .sa_handler = sigint_handler };
+    sigaction(SIGINT, &sa, &old[0]);
+    sigaction(SIGTERM, &sa, &old[1]);
+}
+
+static void restore_stop_handlers(const struct sigaction old[2]) {
+    sigaction(SIGINT, &old[0], NULL);
+    sigaction(SIGTERM, &old[1], NULL);
+}
+
 static bool run_command_pet(pmc_state_t *state, char **argv, double sample_period,
-                            bool verbose, child_outcome_t *outcome) {
+                            bool verbose, const control_t *control,
+                            child_outcome_t *outcome) {
     outcome->reaped = false;
     outcome->status = 0;
 
@@ -878,7 +1324,14 @@ static bool run_command_pet(pmc_state_t *state, char **argv, double sample_perio
     }
 
     if (pid == 0) {
-        // Child: wait for parent to set up profiling
+        // Child: the PMU is the parent's business, so the command runs as the
+        // invoking user rather than as root.
+        if (!drop_privileges()) {
+            perror("mperf: cannot drop privileges");
+            _exit(126);
+        }
+
+        // Wait for parent to set up profiling
         close(sync_pipe[1]);  // Close write end
 
         // Block until parent closes its write end
@@ -895,17 +1348,15 @@ static bool run_command_pet(pmc_state_t *state, char **argv, double sample_perio
     // Parent: set up profiling infrastructure BEFORE letting child run
     close(sync_pipe[0]);  // Close read end
 
-    // Install signal handler so Ctrl+C cleans up kernel profiling state
+    // Install signal handlers so Ctrl+C cleans up kernel profiling state
     g_interrupted = 0;
-    struct sigaction sa = { .sa_handler = sigint_handler };
-    struct sigaction old_sa;
-    sigaction(SIGINT, &sa, &old_sa);
+    struct sigaction old_sa[2];
+    install_stop_handlers(old_sa);
 
     bool result = run_with_pet(state, pid, sample_period, verbose, sync_pipe[1],
-                               outcome);
+                               -1, control, outcome);
 
-    // Restore previous signal handler
-    sigaction(SIGINT, &old_sa, NULL);
+    restore_stop_handlers(old_sa);
 
     if (g_interrupted) {
         fprintf(stderr, "\nInterrupted\n");
@@ -930,21 +1381,18 @@ typedef enum {
     OUTPUT_JSON
 } output_format_t;
 
-// The metric perf prints beside a counter: GHz on cycles, insn per cycle on
-// instructions (tools/perf/util/stat-shadow.c, print_cycles and
-// print_instructions). `fmt` is perf's text format for the value; JSON ignores
-// it and always uses %f.
+// The metric perf 6.x prints beside a counter in text output: GHz on cycles,
+// insn per cycle on instructions (tools/perf/util/stat-shadow.c, print_cycles
+// and print_instructions). `fmt` is perf's format for the value. perf 7.0
+// prints no metric for events named with -e, in text or JSON, and mperf's JSON
+// follows 7.0.
 //
 // GHz divides by task-clock, which is CPU time, not wall time: an N-threaded
 // program accumulates cycles on N cores at once, so wall time would report N
-// times the real clock. getrusage's user+sys is our task-clock. It covers the
-// whole child tree while PET counts only the filtered PID, so a benchmark that
-// forks helpers reads a little low.
+// times the real clock. As in perf, it needs task-clock among the events.
 //
-// METRIC_UNAVAILABLE is perf's third case, where it names the unit but passes a
-// NULL format and a zero: print_metric_std() blanks the column, while
-// print_metric_json() gates on the unit alone and writes
-// "metric-value" : "0.000000". Both behaviours are reproduced, quirk included.
+// METRIC_UNAVAILABLE is perf's case where it names the unit but has no value,
+// and leaves the column blank.
 typedef enum {
     METRIC_NONE,         // perf prints no metric beside this counter
     METRIC_UNAVAILABLE,  // perf names the unit but has no value for it
@@ -955,23 +1403,25 @@ static metric_status_t event_metric(pmc_state_t *state, const char *name,
                                     double *value_out, const char **fmt_out,
                                     const char **unit_out) {
     u64 cycles = 0, instructions = 0;
+    double task_clock_ns = 0;
     for (int i = 0; i < state->event_count; i++) {
         if (strcasecmp(state->events[i].name, "cycles") == 0)
             cycles = state->events[i].value;
         if (strcasecmp(state->events[i].name, "instructions") == 0)
             instructions = state->events[i].value;
+        if (state->events[i].kind == EVENT_TASK_CLOCK)
+            task_clock_ns = (double)state->events[i].value;
     }
 
-    double cpu_time_ns = state->user_time_ns + state->sys_time_ns;
     *value_out = 0.0;
 
     // perf guards this on `cycles && nsecs`.
     if (strcasecmp(name, "cycles") == 0) {
         *fmt_out = "%8.3f";
         *unit_out = "GHz";
-        if (cycles == 0 || cpu_time_ns <= 0) return METRIC_UNAVAILABLE;
+        if (cycles == 0 || task_clock_ns <= 0) return METRIC_UNAVAILABLE;
         // Cycles per nanosecond is already GHz.
-        *value_out = (double)cycles / cpu_time_ns;
+        *value_out = (double)cycles / task_clock_ns;
         return METRIC_OK;
     }
 
@@ -989,21 +1439,25 @@ static metric_status_t event_metric(pmc_state_t *state, const char *name,
 }
 
 static void output_text(pmc_state_t *state, char **cmd, FILE *out) {
-    // Header mirrors perf stat's, with the thread count appended since PET
-    // aggregates across threads and perf has nothing equivalent to report.
-    fprintf(out, "\n Performance counter stats for '");
-    for (int i = 0; cmd[i]; i++)
-        fprintf(out, "%s%s", i ? " " : "", cmd[i]);
-    fprintf(out, "'");
-    if (state->num_threads_seen > 0) {
-        fprintf(out, " (%d thread%s)", state->num_threads_seen,
-                state->num_threads_seen == 1 ? "" : "s");
+    // Header mirrors perf stat's
+    if (state->attached_pid > 0) {
+        fprintf(out, "\n Performance counter stats for process id '%d'",
+                state->attached_pid);
+    } else {
+        fprintf(out, "\n Performance counter stats for '");
+        for (int i = 0; cmd[i]; i++)
+            fprintf(out, "%s%s", i ? " " : "", cmd[i]);
+        fprintf(out, "'");
     }
     fprintf(out, ":\n\n");
 
     for (int i = 0; i < state->event_count; i++) {
         configured_event_t *e = &state->events[i];
-        fprintf(out, "  %'20llu  %-24s", (unsigned long long)e->value, e->name);
+        // task-clock is perf's one msec event; the unit sits before the name
+        if (e->kind == EVENT_TASK_CLOCK)
+            fprintf(out, "  %'15.2f msec  %-24s", e->value / 1e6, e->name);
+        else
+            fprintf(out, "  %'20llu  %-24s", (unsigned long long)e->value, e->name);
 
         // perf lays the metric out as " # ", the value, a space, then the unit;
         // the widths come from its format strings, so the columns line up.
@@ -1020,56 +1474,47 @@ static void output_text(pmc_state_t *state, char **cmd, FILE *out) {
     fprintf(out, "\n");
     fprintf(out, " %17.9f seconds time elapsed\n", state->wall_time_ns / 1e9);
     fprintf(out, "\n");
-    fprintf(out, " %17.9f seconds user\n", state->user_time_ns / 1e9);
-    fprintf(out, " %17.9f seconds sys\n", state->sys_time_ns / 1e9);
-    fprintf(out, "\n");
+    if (state->attached_pid == 0) {
+        fprintf(out, " %17.9f seconds user\n", state->user_time_ns / 1e9);
+        fprintf(out, " %17.9f seconds sys\n", state->sys_time_ns / 1e9);
+        fprintf(out, "\n");
+    }
 }
 
-// perf stat --json emits newline-delimited JSON: one object per counter, no
-// enclosing array, and -- because perf's print_footer() returns early for JSON
-// -- no elapsed/user/sys lines at all. The counter objects below are field for
-// field what perf writes, so a parser built for `perf stat --json` reads them
-// unchanged. The timing perf drops is appended afterwards as metric-only
-// objects, reusing the unit strings from perf's own text footer.
+// perf stat --json emits newline-delimited JSON: one object per event, no
+// enclosing array, no footer. The objects below are field for field what perf
+// 7.0 writes for events named with -e, so a parser built for
+// `perf stat --json` reads them unchanged:
 //
-// Two fields are constants here rather than measurements. PET keeps every
-// requested counter physically active for the whole run (there is no
-// multiplexing, hence the hard limit of 10 events), so the interval an event
-// was enabled is just the wall time, and the running percentage is always 100.
-static void json_metric_line(FILE *out, double value, const char *unit) {
-    fprintf(out, "{\"metric-value\" : \"%f\", \"metric-unit\" : \"%s\"}\n",
-            value, unit);
-}
-
+//   {"counter-value" : "0.770947", "unit" : "msec", "event" : "task-clock", "event-runtime" : 770947, "pcnt-running" : 100.00}
+//   {"counter-value" : "3650166.000000", "unit" : "", "event" : "cycles", "event-runtime" : 770947, "pcnt-running" : 100.00}
+//   {"counter-value" : "1002571504.000000", "unit" : "", "event" : "duration_time", "event-runtime" : 1, "pcnt-running" : 100.00}
+//
+// event-runtime is how long the counter ran, in ns, which for a per-task
+// counter is the task's time on CPU: task-clock. Tool events report 1. PET
+// keeps every requested counter physically active for the whole run (there is
+// no multiplexing, hence the hard limit of 10 events), so the running
+// percentage is always 100. The elapsed/user/sys times come only as the tool
+// events duration_time, user_time and system_time, as in perf.
 static void output_json(pmc_state_t *state, FILE *out) {
     for (int i = 0; i < state->event_count; i++) {
         configured_event_t *e = &state->events[i];
+        double value = (double)e->value;
+        const char *unit = "";
+        u64 runtime = state->task_clock_ns;
 
-        // perf quotes counter-value and prints it as a double; the empty unit
-        // is what perf emits for a plain hardware event.
-        fprintf(out, "{\"counter-value\" : \"%f\", \"unit\" : \"\", "
-                     "\"event\" : \"%s\"", (double)e->value, e->name);
-        fprintf(out, ", \"event-runtime\" : %llu, \"pcnt-running\" : 100.00",
-                (unsigned long long)state->wall_time_ns);
-
-        // perf carries a counter's derived metric on the counter's own object,
-        // including the zero it writes for a metric it could not compute.
-        double value;
-        const char *fmt, *unit;
-        if (event_metric(state, e->name, &value, &fmt, &unit) != METRIC_NONE) {
-            fprintf(out, ", \"metric-value\" : \"%f\", \"metric-unit\" : \"%s\"",
-                    value, unit);
+        if (e->kind == EVENT_TASK_CLOCK) {
+            value /= 1e6;
+            unit = "msec";
+        } else if (e->kind == EVENT_DURATION_TIME || e->kind == EVENT_USER_TIME ||
+                   e->kind == EVENT_SYSTEM_TIME) {
+            runtime = 1;
         }
-        fprintf(out, "}\n");
+
+        fprintf(out, "{\"counter-value\" : \"%f\", \"unit\" : \"%s\", \"event\" : \"%s\", "
+                     "\"event-runtime\" : %llu, \"pcnt-running\" : 100.00}\n",
+                value, unit, e->name, (unsigned long long)runtime);
     }
-
-    json_metric_line(out, state->wall_time_ns / 1e9, "seconds time elapsed");
-    json_metric_line(out, state->user_time_ns / 1e9, "seconds user");
-    json_metric_line(out, state->sys_time_ns / 1e9, "seconds sys");
-
-    // No perf equivalent: PET aggregates across threads and perf has nothing to
-    // report here, so it rides along in the same shape the text header uses.
-    json_metric_line(out, (double)state->num_threads_seen, "threads measured");
 }
 
 // ============================================================================
@@ -1089,8 +1534,8 @@ static bool add_event_list(const char *spec, const char **events, int *count) {
 
     for (char *tok = strtok(copy, ","); tok; tok = strtok(NULL, ",")) {
         if (*tok == '\0') continue;
-        if (*count >= MAX_EVENTS) {
-            fprintf(stderr, "Too many events (max %d)\n", MAX_EVENTS);
+        if (*count >= MAX_LISTED) {
+            fprintf(stderr, "Too many events (max %d)\n", MAX_LISTED);
             return false;
         }
         events[(*count)++] = tok;
@@ -1102,16 +1547,24 @@ static bool add_event_list(const char *spec, const char **events, int *count) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: sudo %s [options] -- command [args...]\n"
+        "       sudo %s [options] -p PID\n"
         "\n"
         "Options:\n"
         "  -e, --event EVENT[,EVENT...]\n"
-        "                       Events to measure (can repeat, max 10 total)\n"
+        "                       Events to measure (can repeat; at most 10\n"
+        "                       hardware events, 16 in all)\n"
         "  -j, --json           Output newline-delimited JSON, one object per\n"
-        "                       counter, as perf stat --json does\n"
+        "                       event, as perf stat --json does\n"
         "  -o, --output FILE    Write the report to FILE instead of stderr\n"
         "      --append         Append to the -o file instead of truncating\n"
         "      --log-fd FD      Write the report to file descriptor FD\n"
         "  -P, --period MS      PET sampling period in milliseconds (default: 1)\n"
+        "  -p, --pid PID        Count an already-running process until it exits\n"
+        "  -D, --delay -1       Start disabled; counting starts on \"enable\" from\n"
+        "                       --control (only -1 is supported)\n"
+        "      --control fifo:CTL[,ACK] | fd:CTL[,ACK]\n"
+        "                       perf stat's control channel: \"enable\" starts\n"
+        "                       counting, answered with \"ack\" once it has\n"
         "  -v, --verbose        Verbose output\n"
         "  -l, --list           List available events\n"
         "  -h, --help           Show this help\n"
@@ -1119,8 +1572,9 @@ static void usage(const char *prog) {
         "The counter report goes to stderr (as perf stat does), so the measured\n"
         "program keeps sole ownership of stdout.\n"
         "\n"
-        "Reserved to match perf stat, not supported yet:\n"
-        "  -p, --pid PID        Attach to an already-running process\n"
+        "The command runs as the invoking user (SUDO_UID under sudo, the real\n"
+        "uid for a setuid install), and -o/--control paths are opened as that\n"
+        "user. A setuid install may only -p the invoking user's processes.\n"
         "\n"
         "This tool uses PET (Profile Every Thread) to accurately measure\n"
         "multi-threaded programs. All threads in the target process are\n"
@@ -1133,11 +1587,15 @@ static void usage(const char *prog) {
         "  ref-cycles (Intel only)\n"
         "  map-stalls, dispatch-stalls (Apple Silicon only)\n"
         "\n"
+        "perf's software and tool events, from the kernel trace and the clock:\n"
+        "  task-clock, page-faults (or faults)\n"
+        "  duration_time, user_time, system_time\n"
+        "\n"
         "Example:\n"
         "  sudo %s -e cycles -e instructions -- ./my_benchmark\n"
         "  sudo %s -j -e cycles -e l1d-tlb-misses -- ./ocaml_program\n"
         "\n",
-        prog, prog, prog);
+        prog, prog, prog, prog);
 }
 
 static void list_events(void) {
@@ -1201,7 +1659,7 @@ int main(int argc, char **argv) {
 
     // Short flags follow perf stat where an equivalent exists. In particular
     // -p is perf's --pid, so the PET sampling period lives on -P/--period.
-    enum { OPT_APPEND = 1000, OPT_LOG_FD };
+    enum { OPT_APPEND = 1000, OPT_LOG_FD, OPT_CONTROL };
 
     static struct option long_opts[] = {
         {"event",   required_argument, 0, 'e'},
@@ -1211,13 +1669,15 @@ int main(int argc, char **argv) {
         {"log-fd",  required_argument, 0, OPT_LOG_FD},
         {"period",  required_argument, 0, 'P'},
         {"pid",     required_argument, 0, 'p'},
+        {"delay",   required_argument, 0, 'D'},
+        {"control", required_argument, 0, OPT_CONTROL},
         {"verbose", no_argument,       0, 'v'},
         {"list",    no_argument,       0, 'l'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
-    const char *events[MAX_EVENTS];
+    const char *events[MAX_LISTED];
     int event_count = 0;
     output_format_t format = OUTPUT_TEXT;
     double sample_period_ms = 1.0;  // 1ms default
@@ -1225,9 +1685,12 @@ int main(int argc, char **argv) {
     const char *output_name = NULL;
     int output_fd = -1;
     bool append = false;
+    pid_t attach_pid = 0;
+    bool delayed = false;
+    const char *control_spec = NULL;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "e:jo:P:p:vlh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "e:jo:P:p:D:vlh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'e':
                 if (!add_event_list(optarg, events, &event_count))
@@ -1256,12 +1719,27 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 break;
-            case 'p':
-                fprintf(stderr,
-                    "Error: -p/--pid (attach to an already-running process) "
-                    "is not supported yet.\n"
-                    "       To set the PET sampling period, use -P/--period MS.\n");
-                return 1;
+            case 'p': {
+                unsigned long pid;
+                if (!parse_id(optarg, &pid) || pid == 0 || pid > INT32_MAX) {
+                    fprintf(stderr, "Invalid pid: %s\n"
+                            "  (the PET sampling period is -P/--period MS)\n", optarg);
+                    return 1;
+                }
+                attach_pid = (pid_t)pid;
+                break;
+            }
+            case 'D':
+                // perf also takes a positive delay in ms; nothing needs it here.
+                if (strcmp(optarg, "-1") != 0) {
+                    fprintf(stderr, "Error: only --delay -1 is supported\n");
+                    return 1;
+                }
+                delayed = true;
+                break;
+            case OPT_CONTROL:
+                control_spec = optarg;
+                break;
             case 'v':
                 verbose = true;
                 break;
@@ -1275,7 +1753,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (optind >= argc) {
+    if (attach_pid > 0 && optind < argc) {
+        fprintf(stderr, "Error: give either -p PID or a command, not both\n");
+        return 1;
+    }
+    if (attach_pid == 0 && optind >= argc) {
         fprintf(stderr, "Error: No command specified\n");
         usage(argv[0]);
         return 1;
@@ -1286,6 +1768,19 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // perf would never enable a --delay -1 run without a control channel, and
+    // would only answer --control commands while running; neither is useful.
+    if (delayed != (control_spec != NULL)) {
+        fprintf(stderr, "Error: --delay -1 and --control go together\n");
+        return 1;
+    }
+
+    // Before anything is opened by name: who those paths belong to.
+    if (!invoker_init()) return 1;
+
+    control_t control = { -1, -1 };
+    if (control_spec && !parse_control(control_spec, &control)) return 1;
+
     // JSON numbers must use C formatting whatever the environment's locale is:
     // a comma decimal separator would emit "ipc": 1,364128 and break parsers.
     if (format == OUTPUT_JSON)
@@ -1295,7 +1790,10 @@ int main(int argc, char **argv) {
     // program. Resolve any redirection now so a bad path fails before we run it.
     FILE *out = stderr;
     if (output_name) {
-        out = fopen(output_name, append ? "a" : "w");
+        int fd = open_as_invoker(output_name,
+                                 O_WRONLY | O_CREAT | O_CLOEXEC | (append ? O_APPEND : O_TRUNC),
+                                 0666);
+        out = fd >= 0 ? fdopen(fd, append ? "a" : "w") : NULL;
         if (!out) {
             fprintf(stderr, "Error: cannot open %s: %s\n",
                     output_name, strerror(errno));
@@ -1327,6 +1825,12 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    // PET only reports threads it has counters for, and those threads are
+    // what task-clock and page-faults are summed over.
+    if (state.pmc_count == 0 && !pmc_add_counter(&state, "cycles", false)) {
+        pmc_cleanup(&state);
+        return 1;
+    }
 
     if (!pmc_configure(&state)) {
         pmc_cleanup(&state);
@@ -1346,8 +1850,45 @@ int main(int argc, char **argv) {
     }
 
     double sample_period_sec = sample_period_ms / 1000.0;
-    child_outcome_t outcome;
-    run_command_pet(&state, &argv[optind], sample_period_sec, verbose, &outcome);
+    child_outcome_t outcome = { false, false, 0 };
+    char pid_label[32];
+    char *attach_argv[] = { pid_label, NULL };
+    char **cmd_argv = &argv[optind];
+    if (attach_pid > 0) {
+        snprintf(pid_label, sizeof(pid_label), "pid %d", attach_pid);
+        cmd_argv = attach_argv;
+        state.attached_pid = attach_pid;
+
+        // Watch for the exit before the ownership check, so a pid that is
+        // recycled after the check is not the one we end up counting.
+        int kq = kqueue();
+        struct kevent ev;
+        EV_SET(&ev, attach_pid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, NULL);
+        if (kq < 0 || kevent(kq, &ev, 1, NULL, 0, NULL) < 0) {
+            fprintf(stderr, "Error: cannot watch pid %d: %s\n", attach_pid, strerror(errno));
+            pmc_cleanup(&state);
+            return 1;
+        }
+        if (!may_attach(attach_pid)) {
+            pmc_cleanup(&state);
+            return 1;
+        }
+
+        g_interrupted = 0;
+        struct sigaction old_sa[2];
+        install_stop_handlers(old_sa);
+        run_with_pet(&state, attach_pid, sample_period_sec, verbose, -1, kq,
+                     &control, &outcome);
+        restore_stop_handlers(old_sa);
+        close(kq);
+
+        // Stopping an attached run is how perf stat -p ends one early too: the
+        // counts so far are still a report, and the target is not ours to wait for.
+        if (g_interrupted) outcome.reaped = true;
+    } else {
+        run_command_pet(&state, cmd_argv, sample_period_sec, verbose, &control,
+                        &outcome);
+    }
 
     // Exit with the command's own status, as perf stat does: its exit code when
     // it exited normally, 128 + signal when it was killed. A tool failure that
@@ -1355,17 +1896,20 @@ int main(int argc, char **argv) {
     int exit_code = 1;
     if (outcome.reaped) {
         if (WIFSIGNALED(outcome.status)) {
-            psignal(WTERMSIG(outcome.status), argv[optind]);
+            psignal(WTERMSIG(outcome.status), cmd_argv[0]);
             exit_code = 128 + WTERMSIG(outcome.status);
         } else {
             exit_code = WEXITSTATUS(outcome.status);
         }
     }
 
-    if (format == OUTPUT_JSON) {
+    // Like perf, a run that never counted leaves no report, only the error.
+    if (!outcome.counted) {
+        exit_code = 1;
+    } else if (format == OUTPUT_JSON) {
         output_json(&state, out);
     } else {
-        output_text(&state, &argv[optind], out);
+        output_text(&state, cmd_argv, out);
     }
     fflush(out);
     if (out != stderr) fclose(out);
