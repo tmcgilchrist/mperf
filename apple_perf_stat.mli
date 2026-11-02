@@ -22,9 +22,7 @@
           ["./benchmark"; "--iterations"; "1000"]
         with
         | Ok m ->
-          Printf.printf "IPC: %.2f (%d threads)\n"
-            (Apple_perf_stat.get_ipc m)
-            m.threads_measured;
+          Printf.printf "IPC: %.2f\n" (Apple_perf_stat.get_ipc m);
           Printf.printf "Wall time: %.3f s\n"
             (Apple_perf_stat.wall_time_seconds m)
         | Error e ->
@@ -32,7 +30,7 @@
     ]}
 *)
 
-(** Counter values as (name, value) pairs *)
+(** Counter values as (name, value) pairs; task-clock is in ns *)
 type counters = (string * int64) list
 
 (** Timing information in nanoseconds *)
@@ -47,7 +45,7 @@ type derived_metrics = {
   ipc : float option;  (** Instructions per cycle *)
   cpi : float option;  (** Cycles per instruction *)
   ghz : float option;  (** Average clock while running: cycles per nanosecond
-                           of CPU time, as [perf stat] reports it *)
+                           of user+sys CPU time *)
 }
 
 (** Result of a PMC measurement run *)
@@ -55,7 +53,6 @@ type measurement = {
   counters : counters;        (** Raw counter values (aggregated across all threads) *)
   time : time_info;           (** Timing information *)
   derived : derived_metrics;  (** Computed metrics *)
-  threads_measured : int;     (** Number of threads that were sampled *)
   exit_code : int;            (** Exit code of measured command *)
 }
 
@@ -90,8 +87,8 @@ val set_tool_path : string -> unit
 
     {b Note:} Requires root privileges.
 
-    {b Multi-threading:} For OCaml 5.x programs with N domains, expect to see
-    approximately 2*N threads measured (each domain has 2 pthreads). *)
+    {b Multi-threading:} For OCaml 5.x programs with N domains, expect
+    [mperf-stat -v] to report about 2*N threads (each domain has 2 pthreads). *)
 val run : ?events:string list -> ?sample_period_ms:float -> string list -> (measurement, error) result
 
 (** {1 Accessing results} *)
@@ -153,6 +150,6 @@ val string_of_error : error -> string
 
     For OCaml 5.x programs:
     - Each domain has 2 pthreads (domain thread + backup for systhreads)
-    - A 4-domain program will show ~8 threads measured
+    - [mperf-stat -v] shows ~8 threads for a 4-domain program
     - Counter values represent total work across all domains
 *)
