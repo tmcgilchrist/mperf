@@ -26,11 +26,23 @@ hello
              1,234,567  cycles
 ```
 
+Note that only the PMU needs root: the measured command, and files opened for `-o` and `--control`, belong to the invoking user (`SUDO_UID` under sudo).
+
+### Running without sudo
+
+```bash
+sudo make install
+sudo chown root:wheel /usr/local/bin/mperf-stat
+sudo chmod u+s /usr/local/bin/mperf-stat
+```
+
+Redo the last two steps after each rebuild. A setuid install only lets `-p` attach to your own processes.
+
 ### What's NOT Required
 
 | Requirement          | Needed? |
 |----------------------|---------|
-| Root/sudo            | ✅ Yes  |
+| Root/sudo            | ✅ Yes (or setuid) |
 | Disable SIP          | ❌ No   |
 | Code signing         | ❌ No   |
 | Notarization         | ❌ No   |
@@ -41,7 +53,7 @@ hello
 
 - The tool uses Apple's private `kperf.framework` and `kperfdata.framework`
 - These are undocumented APIs that could change with macOS updates
-- The tool only reads performance counters; it doesn't modify system state
+- It configures kernel tracing and the counters while running, and resets them on exit, Ctrl+C or SIGTERM (not SIGKILL).
 
 ## Building
 
@@ -73,7 +85,16 @@ sudo ./mperf-stat -j -e cycles -e instructions -- ./benchmark
 
 # List available events
 ./mperf-stat -l
+
+# Count a running process until it exits
+sudo ./mperf-stat -p 1234
+
+# Armed attach for harnesses, as with perf stat: write "enable" to ctl,
+# mperf answers "ack" on ack once counting
+sudo ./mperf-stat -p 1234 --delay -1 --control fifo:ctl,ack
 ```
+
+As with `perf stat -p`, an attached run has no user/sys lines and exits 0. A launched command under `--delay -1` is held until counting starts.
 
 ### Example Output
 
@@ -284,13 +305,15 @@ The tool tracks up to 256 unique threads. For programs with more threads, some d
 
 | Feature        | perf stat (Linux)                          | mperf-stat (macOS)                        |
 |----------------|--------------------------------------------|-------------------------------------------|
-| Invocation     | `perf stat -e events -- cmd`               | `sudo mperf-stat -e events -- cmd`        |
+| Invocation     | `perf stat -e events -- cmd`               | `sudo mperf-stat -e events -- cmd`, or without sudo once setuid |
 | Counting       | Exact when within HW counter limit; scaled estimates when multiplexing | Sampling-based (PET), all counters always active |
 | Root required  | Some events                                | All events                                |
 | Output formats | Text, JSON, CSV                            | Text, JSON                                |
 | JSON shape     | NDJSON, one object per counter, no footer  | Same, plus timing/thread metric objects   |
 | Report stream  | stderr; `-o`, `--append`, `--log-fd`       | Same                                      |
 | Exit status    | Command's exit code, or 128 + signal       | Same                                      |
+| Attach         | `-p PID`                                   | Same                                      |
+| Armed start    | `--delay -1 --control fifo:\|fd:`         | Same (`enable` and `ping` only)           |
 | HW counters    | 4-8 GP + 3-4 fixed (varies by CPU)        | Varies: 2-3 fixed + 4-8 configurable      |
 | Multiplexing   | Yes, with time-scaled estimates            | No (hard limit of 10 events)              |
 | Process scope  | Direct measurement                         | PID-filtered kernel sampling              |
