@@ -1,6 +1,6 @@
-; Builds the mperf-stat CLI with the Makefile's flags. It lives here rather
-; than at the root because `make` leaves ./mperf-stat in the source tree,
-; which dune would refuse as a second rule for the same target.
+; Builds the mperf-stat CLI. This rule is not promoted, so release builds
+; (`dune build -p`, as opam runs) still build and install it. The root dune
+; file copies the result to ./mperf-stat for `sudo ./mperf-stat`.
 
 (rule
  (target mperf-stat)
