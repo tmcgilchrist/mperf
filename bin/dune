@@ -1,0 +1,18 @@
+; Builds the mperf-stat CLI with the Makefile's flags. It lives here rather
+; than at the root because `make` leaves ./mperf-stat in the source tree,
+; which dune would refuse as a second rule for the same target.
+
+(rule
+ (target mperf-stat)
+ (deps ../apple_perf_stat.c)
+ (enabled_if
+  (= %{system} macosx))
+ (action
+  (run %{cc} -O2 -Wall -Wextra -std=c11 -o %{target} %{deps})))
+
+(install
+ (section bin)
+ (package apple-perf-stat)
+ (enabled_if
+  (= %{system} macosx))
+ (files mperf-stat))
