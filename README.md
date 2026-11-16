@@ -46,14 +46,13 @@ hello
 ## Building
 
 ```bash
-# Build the C tool
-make
-
-# Install to /usr/local/bin
-sudo make install
-
-# Build OCaml library
+# Build mperf-stat and the OCaml library, and run the tests.
+# This also leaves a copy at ./mperf-stat, used in the examples below.
 dune build
+dune test
+
+# Or install mperf-stat into your opam switch
+opam install . --with-test
 ```
 
 ## Usage
@@ -74,6 +73,8 @@ sudo ./mperf-stat -j -e cycles -e instructions -- ./benchmark
 # List available events
 ./mperf-stat -l
 ```
+
+If you installed with `opam install`, run `sudo "$(which mperf-stat)"` in place of `sudo ./mperf-stat`, because `sudo` doesn't search your opam switch's `bin` directory.
 
 ### Example Output
 
