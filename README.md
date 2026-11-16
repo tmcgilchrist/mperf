@@ -65,14 +65,13 @@ sudo chmod 4750 /usr/local/bin/mperf-stat
 ## Building
 
 ```bash
-# Build the C tool
-make
-
-# Install to /usr/local/bin
-sudo make install
-
-# Build OCaml library
+# Build mperf-stat and the OCaml library, and run the tests.
+# This also leaves a copy at ./mperf-stat, used in the examples below.
 dune build
+dune test
+
+# Or install mperf-stat into your opam switch
+opam install . --with-test
 ```
 
 ## Usage
@@ -104,6 +103,8 @@ sudo ./mperf-stat -p 1234 --delay -1 --control fifo:ctl,ack
 As with `perf stat -p`, an attached run has no user/sys lines and exits 0. A launched command under `--delay -1` is held until counting starts.
 
 Control commands are read and acknowledged as perf does, before and during counting. `disable` ends the counted window for good, since PET cannot be paused: a later `enable` is acknowledged but changes nothing. After `disable` the elapsed time covers the counted window, but user and sys time still cover the whole command.
+
+If you installed with `opam install`, run `sudo "$(which mperf-stat)"` in place of `sudo ./mperf-stat`, because `sudo` doesn't search your opam switch's `bin` directory.
 
 ### Example Output
 
