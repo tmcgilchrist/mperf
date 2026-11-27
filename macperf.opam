@@ -8,8 +8,8 @@ Provides IPC, cache misses, TLB misses, branch mispredictions, and more."""
 maintainer: ["maintainer@example.com"]
 authors: ["Author Name"]
 license: "MIT"
-homepage: "https://github.com/username/apple-perf-stat"
-bug-reports: "https://github.com/username/apple-perf-stat/issues"
+homepage: "https://github.com/tmcgilchrist/mperf"
+bug-reports: "https://github.com/tmcgilchrist/mperf/issues"
 depends: [
   "ocaml" {>= "4.14"}
   "dune" {>= "3.0"}
@@ -29,5 +29,5 @@ build: [
     "@doc" {with-doc}
   ]
 ]
-dev-repo: "git+https://github.com/username/apple-perf-stat.git"
+dev-repo: "git+https://github.com/tmcgilchrist/mperf.git"
 available: os = "macos"

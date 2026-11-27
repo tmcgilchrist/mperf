@@ -1,10 +1,10 @@
-; Builds the mperf-stat CLI. This rule is not promoted, so release builds
+; Builds the mperf CLI. This rule is not promoted, so release builds
 ; (`dune build -p`, as opam runs) still build and install it. The root dune
-; file copies the result to ./mperf-stat for `sudo ./mperf-stat`.
+; file copies the result to ./mperf for `sudo ./mperf`.
 
 (rule
- (target mperf-stat)
- (deps ../apple_perf_stat.c)
+ (target mperf)
+ (deps ../mperf.c)
  (enabled_if
   (= %{system} macosx))
  (action
@@ -12,7 +12,7 @@
 
 (install
  (section bin)
- (package apple-perf-stat)
+ (package macperf)
  (enabled_if
   (= %{system} macosx))
- (files mperf-stat))
+ (files mperf))

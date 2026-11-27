@@ -1,15 +1,15 @@
 (library
- (name apple_perf_stat)
- (public_name apple-perf-stat)
+ (name mperf)
+ (public_name macperf)
  (libraries unix str))
 
 ; Leave a copy of the CLI at the root after `dune build`, so it can be run
-; as `sudo ./mperf-stat`. Release builds (`dune build -p`, as opam does)
-; ignore this rule and install bin/mperf-stat instead.
+; as `sudo ./mperf`. Release builds (`dune build -p`, as opam does)
+; ignore this rule and install bin/mperf instead.
 (rule
  (mode
   (promote (until-clean)))
  (enabled_if
   (= %{system} macosx))
  (action
-  (copy bin/mperf-stat mperf-stat)))
+  (copy bin/mperf mperf)))
