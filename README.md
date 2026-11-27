@@ -38,6 +38,13 @@ sudo chmod u+s /usr/local/bin/mperf-stat
 
 Redo the last two steps after each rebuild. A setuid install only lets `-p` attach to your own processes.
 
+Every run resets system-wide kdebug/kperf state, ending any other tracing session (`fs_usage`, Instruments). To restrict a setuid install to admins:
+
+```bash
+sudo chown root:admin /usr/local/bin/mperf-stat
+sudo chmod 4750 /usr/local/bin/mperf-stat
+```
+
 ### What's NOT Required
 
 | Requirement          | Needed? |
@@ -95,6 +102,8 @@ sudo ./mperf-stat -p 1234 --delay -1 --control fifo:ctl,ack
 ```
 
 As with `perf stat -p`, an attached run has no user/sys lines and exits 0. A launched command under `--delay -1` is held until counting starts.
+
+Control commands are read and acknowledged as perf does, before and during counting. `disable` ends the counted window for good, since PET cannot be paused: a later `enable` is acknowledged but changes nothing. After `disable` the elapsed time covers the counted window, but user and sys time still cover the whole command.
 
 ### Example Output
 
@@ -313,7 +322,7 @@ The tool tracks up to 256 unique threads. For programs with more threads, some d
 | Report stream  | stderr; `-o`, `--append`, `--log-fd`       | Same                                      |
 | Exit status    | Command's exit code, or 128 + signal       | Same                                      |
 | Attach         | `-p PID`                                   | Same                                      |
-| Armed start    | `--delay -1 --control fifo:\|fd:`         | Same (`enable` and `ping` only)           |
+| Armed start    | `--delay -1 --control fifo:\|fd:`         | Same; one `enable`/`disable` window      |
 | HW counters    | 4-8 GP + 3-4 fixed (varies by CPU)        | Varies: 2-3 fixed + 4-8 configurable      |
 | Multiplexing   | Yes, with time-scaled estimates            | No (hard limit of 10 events)              |
 | Process scope  | Direct measurement                         | PID-filtered kernel sampling              |

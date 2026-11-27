@@ -29,6 +29,8 @@
 #include <signal.h>
 #include <errno.h>
 #include <locale.h>
+#include <limits.h>
+#include <poll.h>
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -674,18 +676,54 @@ static bool may_attach(pid_t pid) {
 // Implements some of perf's --control protocol for an armed start: block for "enable",
 // set up, then answer "ack\n" once counting. A harness that already drives
 // `perf stat --delay -1 --control fifo:ctl,ack` drives mperf the same way.
-// "ping" is acknowledged as perf does and anything else is reported and ignored.
+//
+// Commands are read the way perf reads them (tools/perf/util/evlist.c,
+// evlist__ctlfd_recv): a line ends at '\n', at '\0', or when nothing more is
+// pending, so `echo -n enable > ctl` works; and a command is matched by its
+// prefix, so "enable cycles" counts as "enable". perf acknowledges every
+// command it recognises except "snapshot", and so does mperf, while counting
+// as well as before it starts. "disable" ends the counted window for good:
+// PET cannot be paused and resumed, so a later "enable" is acknowledged but
+// changes nothing. "evlist" and "stop" are acknowledged and otherwise ignored,
+// as perf stat ignores them.
 //
 // Unlike perf, a command mperf launches is held until counting starts rather
 // than started straight away with events disabled: threads it creates before
 // PET is armed would never be counted.
+#define CONTROL_LINE_MAX 128
+
 typedef struct {
-    int ctl_fd;   // -1 when there is no --control
+    int ctl_fd;   // -1 when there is no --control, or once it has closed
     int ack_fd;   // -1 when --control named no ack channel
+    char buf[CONTROL_LINE_MAX];
+    usize len;
+    bool discarding;  // inside an overlong line, dropping it up to its end
 } control_t;
 
+typedef enum {
+    CTL_UNSUPPORTED,
+    CTL_ENABLE,
+    CTL_DISABLE,
+    CTL_SNAPSHOT,
+    CTL_EVLIST,
+    CTL_STOP,
+    CTL_PING,
+} control_cmd_t;
+
+// A descriptor number given as fd:N must name a descriptor mperf inherited.
+static bool parse_control_fd(const char *s, int *fd) {
+    unsigned long v;
+    if (!parse_id(s, &v) || v > INT_MAX) return false;
+    if (fcntl((int)v, F_GETFD) == -1) {
+        fprintf(stderr, "Error: --control fd %lu is not open\n", v);
+        return false;
+    }
+    *fd = (int)v;
+    return true;
+}
+
 static bool parse_control(const char *spec, control_t *c) {
-    c->ctl_fd = c->ack_fd = -1;
+    *c = (control_t){ .ctl_fd = -1, .ack_fd = -1 };
     char *copy = strdup(spec);
     if (!copy) return false;
     char *ack = strchr(copy, ',');
@@ -699,10 +737,8 @@ static bool parse_control(const char *spec, control_t *c) {
         ok = c->ctl_fd >= 0 && (!ack || c->ack_fd >= 0);
         if (!ok) fprintf(stderr, "Error: cannot open --control fifo: %s\n", strerror(errno));
     } else if (strncmp(copy, "fd:", 3) == 0) {
-        unsigned long ctl, ackfd = 0;
-        ok = parse_id(copy + 3, &ctl) && (!ack || parse_id(ack, &ackfd));
-        c->ctl_fd = (int)ctl;
-        c->ack_fd = ack ? (int)ackfd : -1;
+        ok = parse_control_fd(copy + 3, &c->ctl_fd) &&
+             (!ack || parse_control_fd(ack, &c->ack_fd));
         if (!ok) fprintf(stderr, "Error: bad --control fd spec: %s\n", spec);
     } else {
         fprintf(stderr, "Error: --control takes fifo:CTL[,ACK] or fd:CTL[,ACK]\n");
@@ -711,35 +747,133 @@ static bool parse_control(const char *spec, control_t *c) {
     return ok;
 }
 
+// perf writes sizeof(EVLIST_CTL_CMD_ACK_TAG), so its ack carries the NUL too.
 static void control_ack(const control_t *c) {
-    if (c->ack_fd >= 0 && write(c->ack_fd, "ack\n", 4) != 4)
+    static const char ack[] = "ack\n";
+    if (c->ack_fd >= 0 && write(c->ack_fd, ack, sizeof(ack)) != (ssize_t)sizeof(ack))
         perror("Warning: cannot write control ack");
 }
 
-static bool control_wait_enable(const control_t *c) {
-    char buf[128];
-    usize len = 0;
+// Next command into `line`: 1 for a line, 0 if non-blocking and none is
+// pending, -1 on close, error, or a stop signal.
+static int control_next(control_t *c, bool block, char *line) {
     for (;;) {
-        ssize_t n = read(c->ctl_fd, buf + len, sizeof(buf) - 1 - len);
+        // A complete line already buffered?
+        char *end = NULL;
+        for (usize i = 0; i < c->len; i++) {
+            if (c->buf[i] == '\n' || c->buf[i] == '\0') { end = c->buf + i; break; }
+        }
+        if (end) {
+            usize n = (usize)(end - c->buf);
+            bool dropped = c->discarding;
+            c->discarding = false;
+            if (!dropped) {
+                memcpy(line, c->buf, n);
+                line[n] = '\0';
+            }
+            c->len -= n + 1;
+            memmove(c->buf, end + 1, c->len);
+            if (dropped || n == 0) continue;
+            return 1;
+        }
+        if (c->len == sizeof(c->buf) - 1) {
+            // Too long for any command: drop it, and the rest of it as it arrives.
+            if (!c->discarding)
+                fprintf(stderr, "Warning: ignoring overlong control command\n");
+            c->discarding = true;
+            c->len = 0;
+        }
+
+        if (c->ctl_fd < 0) return -1;
+
+        // With a partial line buffered, only look for more that is already
+        // pending: when there is none, the partial line is the command.
+        struct pollfd pfd = { .fd = c->ctl_fd, .events = POLLIN };
+        int r = poll(&pfd, 1, (block && c->len == 0) ? -1 : 0);
+        if (r < 0) {
+            if (errno == EINTR && !g_interrupted) continue;
+            return -1;
+        }
+        if (r == 0) {
+            if (c->len == 0) return 0;
+            bool dropped = c->discarding;
+            c->discarding = false;
+            if (dropped) {
+                c->len = 0;
+                if (block) continue;
+                return 0;
+            }
+            memcpy(line, c->buf, c->len);
+            line[c->len] = '\0';
+            c->len = 0;
+            return 1;
+        }
+
+        ssize_t n = read(c->ctl_fd, c->buf + c->len, sizeof(c->buf) - 1 - c->len);
         if (n < 0 && errno == EINTR && !g_interrupted) continue;
         if (n <= 0) {
-            fprintf(stderr, "Error: control channel closed before \"enable\"\n");
+            // Closed (only an fd: channel can close). A last unterminated line
+            // still counts, as it would for perf.
+            c->ctl_fd = -1;
+            if (c->len > 0 && !c->discarding) {
+                memcpy(line, c->buf, c->len);
+                line[c->len] = '\0';
+                c->len = 0;
+                return 1;
+            }
+            return -1;
+        }
+        c->len += (usize)n;
+    }
+}
+
+static control_cmd_t control_parse(const char *line) {
+    static const struct { const char *tag; control_cmd_t cmd; } cmds[] = {
+        { "enable", CTL_ENABLE }, { "disable", CTL_DISABLE },
+        { "snapshot", CTL_SNAPSHOT }, { "evlist", CTL_EVLIST },
+        { "stop", CTL_STOP }, { "ping", CTL_PING },
+    };
+    for (usize i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+        if (strncmp(line, cmds[i].tag, strlen(cmds[i].tag)) == 0) return cmds[i].cmd;
+    }
+    return CTL_UNSUPPORTED;
+}
+
+// Acknowledge a command the way perf does; for anything but "enable" and
+// "disable" that is all there is to it.
+static control_cmd_t control_handle(const control_t *c, const char *line) {
+    control_cmd_t cmd = control_parse(line);
+    switch (cmd) {
+        case CTL_UNSUPPORTED:
+            fprintf(stderr, "Warning: ignoring control command \"%s\"\n", line);
+            break;
+        case CTL_SNAPSHOT:
+            fprintf(stderr, "Warning: control command \"snapshot\" is not supported\n");
+            break;
+        default:
+            control_ack(c);
+            break;
+    }
+    return cmd;
+}
+
+static bool control_wait_enable(control_t *c) {
+    char line[CONTROL_LINE_MAX];
+    for (;;) {
+        if (control_next(c, true, line) < 0) {
+            if (!g_interrupted)
+                fprintf(stderr, "Error: control channel closed before \"enable\"\n");
             return false;
         }
-        len += (usize)n;
-        buf[len] = '\0';
-
-        char *nl;
-        while ((nl = memchr(buf, '\n', len))) {
-            *nl = '\0';
-            if (strcmp(buf, "enable") == 0) return true;
-            if (strcmp(buf, "ping") == 0) control_ack(c);
-            else fprintf(stderr, "Warning: ignoring control command \"%s\"\n", buf);
-            len -= (usize)(nl + 1 - buf);
-            memmove(buf, nl + 1, len);
-            buf[len] = '\0';
+        control_cmd_t cmd = control_parse(line);
+        if (cmd == CTL_ENABLE) {
+            // Acknowledged once counting has started, not now.
+            if (line[strlen("enable")] != '\0')
+                fprintf(stderr, "Warning: \"%s\": enabling every event, mperf cannot "
+                                "enable them one at a time\n", line);
+            return true;
         }
-        if (len == sizeof(buf) - 1) len = 0;  // an overlong line: drop it
+        control_handle(c, line);
     }
 }
 
@@ -752,7 +886,7 @@ static bool control_wait_enable(const control_t *c) {
 // unreaped zombie of whoever does own it.
 static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
                          double sample_period_sec, bool verbose, int sync_fd,
-                         int exit_kq, const control_t *control,
+                         int exit_kq, control_t *control,
                          child_outcome_t *outcome) {
     bool success = false;
     int ret;
@@ -876,19 +1010,57 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
 
     // Wait for child and collect samples
     int status = 0;
+    bool window_open = true;  // counting, until "disable" or the target exits
+    bool aborted = false;     // stop, and throw away everything counted
     while (1) {
         usleep((useconds_t)(sample_period_sec * 1e6 * 2));
 
         if (g_interrupted) break;
 
+        // Commands sent while counting. "disable" stops sampling before it is
+        // acknowledged, and its window gets one last read below.
+        bool closing = false;
+        if (control->ctl_fd >= 0) {
+            char line[CONTROL_LINE_MAX];
+            while (control_next(control, false, line) > 0) {
+                control_cmd_t cmd = control_parse(line);
+                if (cmd == CTL_DISABLE && window_open) {
+                    kperf_sample_set(0);
+                    gettimeofday(&wall_end, NULL);
+                    window_open = false;
+                    closing = true;
+                } else if (cmd == CTL_ENABLE && !window_open) {
+                    fprintf(stderr, "Warning: counting cannot restart after \"disable\"\n");
+                }
+                control_handle(control, line);
+            }
+        }
+
         // Check if child exited. An attached target's status belongs to its
         // own parent; perf stat -p reports 0 for it, and so do we.
-        pid_t result;
+        pid_t result = 0;
         if (exit_kq >= 0) {
             struct kevent ev;
             struct timespec zero = { 0, 0 };
             int n = kevent(exit_kq, NULL, 0, &ev, 1, &zero);
-            result = n > 0 ? target_pid : n;
+            if (n < 0) {
+                result = -1;
+            } else if (n > 0 && (ev.flags & EV_ERROR)) {
+                fprintf(stderr, "Error: lost track of pid %d: %s\n",
+                        target_pid, strerror((int)ev.data));
+                aborted = true;
+                break;
+            } else if (n > 0 && (ev.fflags & NOTE_EXIT)) {
+                result = target_pid;
+            } else if (n > 0 && (ev.fflags & NOTE_EXEC) && g_invoker.setuid &&
+                       !may_attach(target_pid)) {
+                // The target became a program the user may not measure, such
+                // as a setuid binary: none of what was counted can be shown.
+                fprintf(stderr, "Error: pid %d ran a program you may not measure\n",
+                        target_pid);
+                aborted = true;
+                break;
+            }
         } else {
             result = waitpid(target_pid, &status, WNOHANG);
         }
@@ -897,7 +1069,13 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
             outcome->reaped = true;
             outcome->status = status;
             // Child exited, do one more read then stop
-            usleep((useconds_t)(sample_period_sec * 1e6));
+            if (window_open) usleep((useconds_t)(sample_period_sec * 1e6));
+        }
+
+        // After "disable" there is nothing more to read; just wait for the exit.
+        if (!window_open && !closing) {
+            if (result == target_pid) break;
+            continue;
         }
 
         // Expand buffer if needed
@@ -937,9 +1115,14 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
         if (result == target_pid) break;
     }
 
-    // Record end time
-    gettimeofday(&wall_end, NULL);
+    // After "disable", wall_end is already set; user/sys still cover the whole command.
+    if (window_open) gettimeofday(&wall_end, NULL);
     getrusage(RUSAGE_CHILDREN, &usage_end);
+
+    if (aborted) {
+        free(buf_storage);
+        goto cleanup;
+    }
 
     // Process collected samples
     thread_tracker_t tracker = { 0 };
@@ -1081,7 +1264,7 @@ static void restore_stop_handlers(const struct sigaction old[2]) {
 }
 
 static bool run_command_pet(pmc_state_t *state, char **argv, double sample_period,
-                            bool verbose, const control_t *control,
+                            bool verbose, control_t *control,
                             child_outcome_t *outcome) {
     outcome->reaped = false;
     outcome->status = 0;
@@ -1107,6 +1290,7 @@ static bool run_command_pet(pmc_state_t *state, char **argv, double sample_perio
     if (pid == 0) {
         // Child: because the PMU is processed via the parent, the command runs as the
         // invoking user rather than as root.
+        signal(SIGPIPE, SIG_DFL);  // mperf ignores it; the command must not
         if (!drop_privileges()) {
             perror("mperf: cannot drop privileges");
             _exit(126);
@@ -1359,7 +1543,8 @@ static void usage(const char *prog) {
         "                       --control (only -1 is supported)\n"
         "      --control fifo:CTL[,ACK] | fd:CTL[,ACK]\n"
         "                       perf stat's control channel: \"enable\" starts\n"
-        "                       counting, answered with \"ack\" once it has\n"
+        "                       counting, answered with \"ack\" once it has;\n"
+        "                       \"disable\" ends it\n"
         "  -v, --verbose        Verbose output\n"
         "  -l, --list           List available events\n"
         "  -h, --help           Show this help\n"
@@ -1447,6 +1632,11 @@ int main(int argc, char **argv) {
     // The %' thousands separators in the report are a no-op under the default C
     // locale, so adopt the environment's locale the way perf does.
     setlocale(LC_ALL, "");
+
+    // A harness that closes its end of the ack channel must not kill mperf
+    // with SIGPIPE before teardown: the kernel state would stay configured.
+    // A failed ack write is reported as a warning instead.
+    signal(SIGPIPE, SIG_IGN);
 
     // Short flags follow perf stat where an equivalent exists. In particular
     // -p is perf's --pid, so the PET sampling period lives on -P/--period.
@@ -1567,7 +1757,7 @@ int main(int argc, char **argv) {
     // Before anything is opened by name: who those paths belong to.
     if (!invoker_init()) return 1;
 
-    control_t control = { -1, -1 };
+    control_t control = { .ctl_fd = -1, .ack_fd = -1 };
     if (control_spec && !parse_control(control_spec, &control)) return 1;
 
     // JSON numbers must use C formatting whatever the environment's locale is:
@@ -1584,6 +1774,9 @@ int main(int argc, char **argv) {
                                  0666);
         out = fd >= 0 ? fdopen(fd, append ? "a" : "w") : NULL;
         if (!out) {
+            int err = errno;
+            if (fd >= 0) close(fd);
+            errno = err;
             fprintf(stderr, "Error: cannot open %s: %s\n",
                     output_name, strerror(errno));
             return 1;
@@ -1643,10 +1836,12 @@ int main(int argc, char **argv) {
         state.attached_pid = attach_pid;
 
         // Watch for the exit before the ownership check, so a pid that is
-        // recycled after the check is not the one we end up counting.
+        // recycled after the check is not the one we end up counting. Exec is
+        // watched too: the check is repeated whenever the target execs, since
+        // it may have become a setuid program.
         int kq = kqueue();
         struct kevent ev;
-        EV_SET(&ev, attach_pid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, NULL);
+        EV_SET(&ev, attach_pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXIT | NOTE_EXEC, 0, NULL);
         if (kq < 0 || kevent(kq, &ev, 1, NULL, 0, NULL) < 0) {
             fprintf(stderr, "Error: cannot watch pid %d: %s\n", attach_pid, strerror(errno));
             pmc_cleanup(&state);
