@@ -31,19 +31,13 @@ Note that only the PMU needs root: the measured command, and files opened for `-
 ### Running without sudo
 
 ```bash
-sudo make install
-sudo chown root:wheel /usr/local/bin/mperf-stat
-sudo chmod u+s /usr/local/bin/mperf-stat
+dune build
+sudo install -o root -g wheel -m 4755 _build/default/bin/mperf-stat /usr/local/bin/
 ```
 
-Redo the last two steps after each rebuild. A setuid install only lets `-p` attach to your own processes.
+Redo the install after each rebuild. A setuid install only lets `-p` attach to your own processes.
 
-Every run resets system-wide kdebug/kperf state, ending any other tracing session (`fs_usage`, Instruments). To restrict a setuid install to admins:
-
-```bash
-sudo chown root:admin /usr/local/bin/mperf-stat
-sudo chmod 4750 /usr/local/bin/mperf-stat
-```
+Every run resets system-wide kdebug/kperf state, ending any other tracing session (`fs_usage`, Instruments). To restrict a setuid install to admins, use `-g admin -m 4750` instead.
 
 ### What's NOT Required
 

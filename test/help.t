@@ -3,16 +3,25 @@ and -h print it and exit 0.
 
   $ mperf-stat --help
   Usage: sudo mperf-stat [options] -- command [args...]
+         sudo mperf-stat [options] -p PID
   
   Options:
     -e, --event EVENT[,EVENT...]
-                         Events to measure (can repeat, max 10 total)
+                         Events to measure (can repeat; at most 10
+                         hardware events, 16 in all)
     -j, --json           Output newline-delimited JSON, one object per
-                         counter, as perf stat --json does
+                         event, as perf stat --json does
     -o, --output FILE    Write the report to FILE instead of stderr
         --append         Append to the -o file instead of truncating
         --log-fd FD      Write the report to file descriptor FD
     -P, --period MS      PET sampling period in milliseconds (default: 1)
+    -p, --pid PID        Count an already-running process until it exits
+    -D, --delay -1       Start disabled; counting starts on "enable" from
+                         --control (only -1 is supported)
+        --control fifo:CTL[,ACK] | fd:CTL[,ACK]
+                         perf stat's control channel: "enable" starts
+                         counting, answered with "ack" once it has;
+                         "disable" ends it
     -v, --verbose        Verbose output
     -l, --list           List available events
     -h, --help           Show this help
@@ -20,8 +29,9 @@ and -h print it and exit 0.
   The counter report goes to stderr (as perf stat does), so the measured
   program keeps sole ownership of stdout.
   
-  Reserved to match perf stat, not supported yet:
-    -p, --pid PID        Attach to an already-running process
+  The command runs as the invoking user (SUDO_UID under sudo, the real
+  uid for a setuid install), and -o/--control paths are opened as that
+  user. A setuid install may only -p the invoking user's processes.
   
   This tool uses PET (Profile Every Thread) to accurately measure
   multi-threaded programs. All threads in the target process are
@@ -33,6 +43,10 @@ and -h print it and exit 0.
     l1d-cache-misses, l1i-cache-misses, llc-misses
     ref-cycles (Intel only)
     map-stalls, dispatch-stalls (Apple Silicon only)
+  
+  perf's software and tool events, from the kernel trace and the clock:
+    task-clock, page-faults (or faults)
+    duration_time, user_time, system_time
   
   Example:
     sudo mperf-stat -e cycles -e instructions -- ./my_benchmark
@@ -49,16 +63,25 @@ and fail.
   $ mperf-stat
   Error: No command specified
   Usage: sudo mperf-stat [options] -- command [args...]
+         sudo mperf-stat [options] -p PID
   
   Options:
     -e, --event EVENT[,EVENT...]
-                         Events to measure (can repeat, max 10 total)
+                         Events to measure (can repeat; at most 10
+                         hardware events, 16 in all)
     -j, --json           Output newline-delimited JSON, one object per
-                         counter, as perf stat --json does
+                         event, as perf stat --json does
     -o, --output FILE    Write the report to FILE instead of stderr
         --append         Append to the -o file instead of truncating
         --log-fd FD      Write the report to file descriptor FD
     -P, --period MS      PET sampling period in milliseconds (default: 1)
+    -p, --pid PID        Count an already-running process until it exits
+    -D, --delay -1       Start disabled; counting starts on "enable" from
+                         --control (only -1 is supported)
+        --control fifo:CTL[,ACK] | fd:CTL[,ACK]
+                         perf stat's control channel: "enable" starts
+                         counting, answered with "ack" once it has;
+                         "disable" ends it
     -v, --verbose        Verbose output
     -l, --list           List available events
     -h, --help           Show this help
@@ -66,8 +89,9 @@ and fail.
   The counter report goes to stderr (as perf stat does), so the measured
   program keeps sole ownership of stdout.
   
-  Reserved to match perf stat, not supported yet:
-    -p, --pid PID        Attach to an already-running process
+  The command runs as the invoking user (SUDO_UID under sudo, the real
+  uid for a setuid install), and -o/--control paths are opened as that
+  user. A setuid install may only -p the invoking user's processes.
   
   This tool uses PET (Profile Every Thread) to accurately measure
   multi-threaded programs. All threads in the target process are
@@ -79,6 +103,10 @@ and fail.
     l1d-cache-misses, l1i-cache-misses, llc-misses
     ref-cycles (Intel only)
     map-stalls, dispatch-stalls (Apple Silicon only)
+  
+  perf's software and tool events, from the kernel trace and the clock:
+    task-clock, page-faults (or faults)
+    duration_time, user_time, system_time
   
   Example:
     sudo mperf-stat -e cycles -e instructions -- ./my_benchmark
@@ -89,16 +117,25 @@ and fail.
   $ mperf-stat -e cycles
   Error: No command specified
   Usage: sudo mperf-stat [options] -- command [args...]
+         sudo mperf-stat [options] -p PID
   
   Options:
     -e, --event EVENT[,EVENT...]
-                         Events to measure (can repeat, max 10 total)
+                         Events to measure (can repeat; at most 10
+                         hardware events, 16 in all)
     -j, --json           Output newline-delimited JSON, one object per
-                         counter, as perf stat --json does
+                         event, as perf stat --json does
     -o, --output FILE    Write the report to FILE instead of stderr
         --append         Append to the -o file instead of truncating
         --log-fd FD      Write the report to file descriptor FD
     -P, --period MS      PET sampling period in milliseconds (default: 1)
+    -p, --pid PID        Count an already-running process until it exits
+    -D, --delay -1       Start disabled; counting starts on "enable" from
+                         --control (only -1 is supported)
+        --control fifo:CTL[,ACK] | fd:CTL[,ACK]
+                         perf stat's control channel: "enable" starts
+                         counting, answered with "ack" once it has;
+                         "disable" ends it
     -v, --verbose        Verbose output
     -l, --list           List available events
     -h, --help           Show this help
@@ -106,8 +143,9 @@ and fail.
   The counter report goes to stderr (as perf stat does), so the measured
   program keeps sole ownership of stdout.
   
-  Reserved to match perf stat, not supported yet:
-    -p, --pid PID        Attach to an already-running process
+  The command runs as the invoking user (SUDO_UID under sudo, the real
+  uid for a setuid install), and -o/--control paths are opened as that
+  user. A setuid install may only -p the invoking user's processes.
   
   This tool uses PET (Profile Every Thread) to accurately measure
   multi-threaded programs. All threads in the target process are
@@ -119,6 +157,10 @@ and fail.
     l1d-cache-misses, l1i-cache-misses, llc-misses
     ref-cycles (Intel only)
     map-stalls, dispatch-stalls (Apple Silicon only)
+  
+  perf's software and tool events, from the kernel trace and the clock:
+    task-clock, page-faults (or faults)
+    duration_time, user_time, system_time
   
   Example:
     sudo mperf-stat -e cycles -e instructions -- ./my_benchmark
