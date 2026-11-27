@@ -642,9 +642,14 @@ typedef struct {
     bool full;
 } usage_tracker_t;
 
+// Probes are capped, so a table crowded with other processes' threads costs a
+// bounded lookup rather than a scan of every slot.
+#define TID_MAX_PROBES  256
+
 static tid_usage_t *usage_get(usage_tracker_t *u, u64 tid) {
+    if (tid == 0) return NULL;  // 0 marks an empty slot
     u64 h = (tid * 0x9E3779B97F4A7C15ull) & (TID_SLOTS - 1);
-    for (u64 i = 0; i < TID_SLOTS; i++) {
+    for (u64 i = 0; i < TID_MAX_PROBES; i++) {
         tid_usage_t *t = &u->slots[(h + i) & (TID_SLOTS - 1)];
         if (t->tid == tid) return t;
         if (t->tid == 0) {
@@ -689,6 +694,24 @@ static void usage_mark_threads(usage_tracker_t *u, pid_t pid) {
         tid_usage_t *t = usage_get(u, tids[i]);
         if (t) t->target = true;
     }
+}
+
+// Credit each CPU's running thread up to `now`, the last read. Without this
+// the slice still running when counting ends would be lost.
+static void usage_close(usage_tracker_t *u, u64 now) {
+    for (u32 cpu = 0; cpu < TRACE_MAX_CPUS; cpu++) {
+        tid_usage_t *t;
+        if (u->cpu_since[cpu] && now > u->cpu_since[cpu] &&
+            (t = usage_get(u, u->cpu_tid[cpu])))
+            t->on_cpu += now - u->cpu_since[cpu];
+        u->cpu_since[cpu] = 0;
+    }
+}
+
+// After lost records, who was on each CPU since when is unknown; crediting
+// the old switch-in would count the gap as time on CPU.
+static void usage_forget_cpus(usage_tracker_t *u) {
+    memset(u->cpu_since, 0, sizeof(u->cpu_since));
 }
 
 static void usage_totals(const usage_tracker_t *u, u64 *task_clock_ns, u64 *faults) {
@@ -1080,11 +1103,6 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
     u32 actionid = 1;
     u32 timerid = 1;
 
-    // A killed mperf leaves sampling on, and kperf cannot be reconfigured
-    // while it is. perf has no such problem: the kernel drops its events.
-    kperf_sample_set(0);
-    kperf_lightweight_pet_set(0);
-
     if ((ret = kperf_action_count_set(KPERF_ACTION_MAX))) {
         fprintf(stderr, "Error: Failed to set action count: %d\n", ret);
         goto fail_early;
@@ -1155,13 +1173,22 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
         fprintf(stderr, "Error: Failed to set kdebug filter: %d\n", ret);
         goto fail_early;
     }
+    // Allocated before the command is released, so a failure leaves it unrun.
+    usize buf_capacity = nbufs * 2;
+    kd_buf *buf_storage = malloc(sizeof(kd_buf) * buf_capacity);
     usage_tracker_t usage = { .slots = calloc(TID_SLOTS, sizeof(tid_usage_t)) };
-    if (!usage.slots) {
-        fprintf(stderr, "Error: Failed to allocate thread table\n");
+    if (!buf_storage || !usage.slots) {
+        fprintf(stderr, "Error: Failed to allocate trace buffers\n");
+        free(buf_storage);
+        free(usage.slots);
         goto fail_early;
     }
+    kd_buf *buf_cur = buf_storage;
+    kd_buf *buf_end = buf_storage + buf_capacity;
+
     if ((ret = kdebug_trace_enable(1))) {
         fprintf(stderr, "Error: Failed to enable kdebug: %d\n", ret);
+        free(buf_storage);
         free(usage.slots);
         goto fail_early;
     }
@@ -1178,21 +1205,10 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
         sync_fd = -1;
     }
 
-    // Allocate trace buffer
-    usize buf_capacity = nbufs * 2;
-    kd_buf *buf_storage = malloc(sizeof(kd_buf) * buf_capacity);
-    kd_buf *buf_cur = buf_storage;
-    kd_buf *buf_end = buf_storage + buf_capacity;
-
-    if (!buf_storage) {
-        fprintf(stderr, "Error: Failed to allocate trace buffer\n");
-        free(usage.slots);
-        goto cleanup;
-    }
-
     usize total_raw_samples = 0;
     usize total_filtered_samples = 0;
     bool wrapped = false;
+    u64 last_read = 0;  // mach time, the clock kdebug timestamps use
 
     // Record start time
     struct timeval wall_start, wall_end;
@@ -1286,8 +1302,12 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
 
         // Read trace data. A read clears the wrapped flag, so check it first.
         usize count = 0;
-        wrapped |= kdebug_wrapped();
+        if (kdebug_wrapped()) {
+            wrapped = true;
+            usage_forget_cpus(&usage);
+        }
         kdebug_trace_read(buf_cur, sizeof(kd_buf) * nbufs, &count);
+        last_read = mach_absolute_time();
         total_raw_samples += count;
 
         // Tally the scheduler and VM events, and keep the PMC thread data
@@ -1313,8 +1333,11 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
     if (window_open) gettimeofday(&wall_end, NULL);
     getrusage(RUSAGE_CHILDREN, &usage_end);
 
+    // A stopped run has nothing that may be reported.
     if (aborted) {
+        outcome->counted = false;
         free(buf_storage);
+        free(usage.slots);
         goto cleanup;
     }
 
@@ -1368,10 +1391,11 @@ static bool run_with_pet(pmc_state_t *state, pid_t target_pid,
 
     free(buf_storage);
 
+    if (last_read) usage_close(&usage, last_read);
     usage_totals(&usage, &state->task_clock_ns, &state->page_faults);
     free(usage.slots);
     if (wrapped)
-        fprintf(stderr, "Warning: the kernel trace buffer wrapped; counts are low\n");
+        fprintf(stderr, "Warning: the kernel trace buffer wrapped; counts are inaccurate\n");
     if (usage.full)
         fprintf(stderr, "Warning: too many threads in the system to track task-clock\n");
 
@@ -2021,6 +2045,11 @@ int main(int argc, char **argv) {
         pmc_cleanup(&state);
         return 1;
     }
+
+    // A killed mperf leaves sampling and tracing on, and kperf cannot be
+    // reconfigured while it is. perf has no such problem: the kernel drops its
+    // events. Reset before anything is configured.
+    profiling_cleanup();
 
     if (!pmc_configure(&state)) {
         pmc_cleanup(&state);

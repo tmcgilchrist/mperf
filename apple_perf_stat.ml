@@ -81,6 +81,10 @@ end
 (* perf's tool events for the run's own times, in ns *)
 let time_events = ["duration_time"; "user_time"; "system_time"]
 
+(* Counted from the kernel trace rather than by PET, so they say nothing
+   about whether PET sampled the program. *)
+let software_events = ["task-clock"; "page-faults"; "faults"]
+
 let parse_json_output output =
   let events =
     List.filter_map
@@ -118,7 +122,13 @@ let parse_json_output output =
     | Some v when v > 0L -> Some (Int64.to_float v)
     | _ -> None
   in
-  let cpu_ns = time.user_ns +. time.sys_ns in
+  (* GHz over task-clock, as the C tool reports it, when it was counted;
+     otherwise user+sys, which also covers any processes the command forks. *)
+  let cpu_ns =
+    match count "task-clock" with
+    | Some ns -> ns
+    | None -> time.user_ns +. time.sys_ns
+  in
   let ipc =
     match count "cycles", count "instructions" with
     | Some c, Some i -> Some (i /. c)
@@ -184,7 +194,11 @@ let run ?(events = ["cycles"; "instructions"]) ?(sample_period_ms = 1.0) command
     else
       try
         let result = parse_json_output output in
-        if List.for_all (fun (_, v) -> v = 0L) result.counters then
+        let pmc =
+          List.filter (fun (name, _) -> not (List.mem name software_events))
+            result.counters
+        in
+        if pmc <> [] && List.for_all (fun (_, v) -> v = 0L) pmc then
           Error (No_samples "No thread samples collected - program may have been too short")
         else
           Ok { result with exit_code }
