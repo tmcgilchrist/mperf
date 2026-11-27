@@ -1,4 +1,4 @@
 (cram
- (deps %{bin:mperf-stat})
+ (deps %{bin:mperf})
  (enabled_if
   (= %{system} macosx)))

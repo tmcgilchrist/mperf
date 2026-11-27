@@ -1,9 +1,9 @@
 The usage text goes to stderr and names the binary as it was invoked. --help
 and -h print it and exit 0.
 
-  $ mperf-stat --help
-  Usage: sudo mperf-stat [options] -- command [args...]
-         sudo mperf-stat [options] -p PID
+  $ mperf --help
+  Usage: sudo mperf [options] -- command [args...]
+         sudo mperf [options] -p PID
   
   Options:
     -e, --event EVENT[,EVENT...]
@@ -49,21 +49,21 @@ and -h print it and exit 0.
     duration_time, user_time, system_time
   
   Example:
-    sudo mperf-stat -e cycles -e instructions -- ./my_benchmark
-    sudo mperf-stat -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
+    sudo mperf -e cycles -e instructions -- ./my_benchmark
+    sudo mperf -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
   
 
-  $ mperf-stat --help > long 2>&1
-  $ mperf-stat -h > short 2>&1
+  $ mperf --help > long 2>&1
+  $ mperf -h > short 2>&1
   $ cmp long short
 
 With no command to measure there is nothing to do: report it, show the usage,
 and fail.
 
-  $ mperf-stat
+  $ mperf
   Error: No command specified
-  Usage: sudo mperf-stat [options] -- command [args...]
-         sudo mperf-stat [options] -p PID
+  Usage: sudo mperf [options] -- command [args...]
+         sudo mperf [options] -p PID
   
   Options:
     -e, --event EVENT[,EVENT...]
@@ -109,15 +109,15 @@ and fail.
     duration_time, user_time, system_time
   
   Example:
-    sudo mperf-stat -e cycles -e instructions -- ./my_benchmark
-    sudo mperf-stat -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
+    sudo mperf -e cycles -e instructions -- ./my_benchmark
+    sudo mperf -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
   
   [1]
 
-  $ mperf-stat -e cycles
+  $ mperf -e cycles
   Error: No command specified
-  Usage: sudo mperf-stat [options] -- command [args...]
-         sudo mperf-stat [options] -p PID
+  Usage: sudo mperf [options] -- command [args...]
+         sudo mperf [options] -p PID
   
   Options:
     -e, --event EVENT[,EVENT...]
@@ -163,7 +163,7 @@ and fail.
     duration_time, user_time, system_time
   
   Example:
-    sudo mperf-stat -e cycles -e instructions -- ./my_benchmark
-    sudo mperf-stat -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
+    sudo mperf -e cycles -e instructions -- ./my_benchmark
+    sudo mperf -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
   
   [1]

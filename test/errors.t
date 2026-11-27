@@ -1,13 +1,13 @@
-Argument errors are all caught before mperf-stat loads the PMC frameworks, so
+Argument errors are all caught before mperf loads the PMC frameworks, so
 none of these need root.
 
 Unknown options and missing arguments get getopt's own message (worded by the
 platform's libc), then the usage text.
 
-  $ mperf-stat --frobnicate -- true
-  mperf-stat: unrecognized option `--frobnicate'
-  Usage: sudo mperf-stat [options] -- command [args...]
-         sudo mperf-stat [options] -p PID
+  $ mperf --frobnicate -- true
+  mperf: unrecognized option `--frobnicate'
+  Usage: sudo mperf [options] -- command [args...]
+         sudo mperf [options] -p PID
   
   Options:
     -e, --event EVENT[,EVENT...]
@@ -53,15 +53,15 @@ platform's libc), then the usage text.
     duration_time, user_time, system_time
   
   Example:
-    sudo mperf-stat -e cycles -e instructions -- ./my_benchmark
-    sudo mperf-stat -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
+    sudo mperf -e cycles -e instructions -- ./my_benchmark
+    sudo mperf -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
   
   [1]
 
-  $ mperf-stat -x -- true
-  mperf-stat: invalid option -- x
-  Usage: sudo mperf-stat [options] -- command [args...]
-         sudo mperf-stat [options] -p PID
+  $ mperf -x -- true
+  mperf: invalid option -- x
+  Usage: sudo mperf [options] -- command [args...]
+         sudo mperf [options] -p PID
   
   Options:
     -e, --event EVENT[,EVENT...]
@@ -107,15 +107,15 @@ platform's libc), then the usage text.
     duration_time, user_time, system_time
   
   Example:
-    sudo mperf-stat -e cycles -e instructions -- ./my_benchmark
-    sudo mperf-stat -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
+    sudo mperf -e cycles -e instructions -- ./my_benchmark
+    sudo mperf -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
   
   [1]
 
-  $ mperf-stat -e
-  mperf-stat: option requires an argument -- e
-  Usage: sudo mperf-stat [options] -- command [args...]
-         sudo mperf-stat [options] -p PID
+  $ mperf -e
+  mperf: option requires an argument -- e
+  Usage: sudo mperf [options] -- command [args...]
+         sudo mperf [options] -p PID
   
   Options:
     -e, --event EVENT[,EVENT...]
@@ -161,92 +161,92 @@ platform's libc), then the usage text.
     duration_time, user_time, system_time
   
   Example:
-    sudo mperf-stat -e cycles -e instructions -- ./my_benchmark
-    sudo mperf-stat -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
+    sudo mperf -e cycles -e instructions -- ./my_benchmark
+    sudo mperf -j -e cycles -e l1d-tlb-misses -- ./ocaml_program
   
   [1]
 
 -p attaches to a running process, so it cannot also be given a command, and
 it needs a positive pid. The PET sampling period is -P.
 
-  $ mperf-stat -p 123 -- true
+  $ mperf -p 123 -- true
   Error: give either -p PID or a command, not both
   [1]
 
-  $ mperf-stat --pid 123 -- true
+  $ mperf --pid 123 -- true
   Error: give either -p PID or a command, not both
   [1]
 
-  $ mperf-stat -p 0
+  $ mperf -p 0
   Invalid pid: 0
     (the PET sampling period is -P/--period MS)
   [1]
 
-  $ mperf-stat -p abc
+  $ mperf -p abc
   Invalid pid: abc
     (the PET sampling period is -P/--period MS)
   [1]
 
 Only perf's --delay -1 is supported, and it goes with --control.
 
-  $ mperf-stat --delay 100 -- true
+  $ mperf --delay 100 -- true
   Error: only --delay -1 is supported
   [1]
 
-  $ mperf-stat --delay -1 -- true
+  $ mperf --delay -1 -- true
   Error: --delay -1 must go with --control
   [1]
 
-  $ mperf-stat --control fifo:ctl -- true
+  $ mperf --control fifo:ctl -- true
   Error: --delay -1 must go with --control
   [1]
 
 --control takes fifo:CTL[,ACK] or fd:CTL[,ACK], and an fd must be open.
 
-  $ mperf-stat --delay -1 --control pipe:ctl -- true
+  $ mperf --delay -1 --control pipe:ctl -- true
   Error: --control takes fifo:CTL[,ACK] or fd:CTL[,ACK]
   [1]
 
-  $ mperf-stat --delay -1 --control fd:4294967299 -- true
+  $ mperf --delay -1 --control fd:4294967299 -- true
   Error: bad --control fd spec: fd:4294967299
   [1]
 
-  $ mperf-stat --delay -1 --control fd:2147483647 -- true
+  $ mperf --delay -1 --control fd:2147483647 -- true
   Error: --control fd 2147483647 is not open
   [1]
 
 The PET sampling period must be a positive number of milliseconds.
 
-  $ mperf-stat -P 0 -- true
+  $ mperf -P 0 -- true
   Invalid sample period
   [1]
 
-  $ mperf-stat -P -1 -- true
+  $ mperf -P -1 -- true
   Invalid sample period
   [1]
 
-  $ mperf-stat --period abc -- true
+  $ mperf --period abc -- true
   Invalid sample period
   [1]
 
-  $ mperf-stat -P 1abc -- true
+  $ mperf -P 1abc -- true
   Invalid sample period
   [1]
 
 --log-fd must be a descriptor number.
 
-  $ mperf-stat --log-fd -1 -- true
+  $ mperf --log-fd -1 -- true
   Invalid --log-fd: -1
   [1]
 
-  $ mperf-stat --log-fd abc -- true
+  $ mperf --log-fd abc -- true
   Invalid --log-fd: abc
   [1]
 
 The report can go to a file or to a descriptor, not both. This is checked
 after the command, so one has to be given.
 
-  $ mperf-stat --output report.txt --log-fd 3 -- true
+  $ mperf --output report.txt --log-fd 3 -- true
   Error: cannot use both --output and --log-fd
   [1]
 
@@ -254,10 +254,10 @@ after the command, so one has to be given.
 repeated -e flags. (The limit of 10 hardware events is checked once the PMC
 database is loaded, which needs root.)
 
-  $ mperf-stat -e cycles,instructions,branches,branch-misses,l1d-tlb-misses,l1i-tlb-misses,l2-tlb-misses-data,l1d-cache-misses,l1i-cache-misses,llc-misses,task-clock,page-faults,duration_time,user_time,system_time,cycles,instructions -- true
+  $ mperf -e cycles,instructions,branches,branch-misses,l1d-tlb-misses,l1i-tlb-misses,l2-tlb-misses-data,l1d-cache-misses,l1i-cache-misses,llc-misses,task-clock,page-faults,duration_time,user_time,system_time,cycles,instructions -- true
   Too many events (max 16)
   [1]
 
-  $ mperf-stat -e cycles,instructions,branches,branch-misses,l1d-tlb-misses,l1i-tlb-misses -e l2-tlb-misses-data,l1d-cache-misses,l1i-cache-misses,llc-misses,task-clock -e page-faults,duration_time,user_time,system_time,cycles,instructions -- true
+  $ mperf -e cycles,instructions,branches,branch-misses,l1d-tlb-misses,l1i-tlb-misses -e l2-tlb-misses-data,l1d-cache-misses,l1i-cache-misses,llc-misses,task-clock -e page-faults,duration_time,user_time,system_time,cycles,instructions -- true
   Too many events (max 16)
   [1]

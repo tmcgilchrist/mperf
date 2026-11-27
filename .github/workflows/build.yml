@@ -35,4 +35,4 @@ jobs:
         run: opam exec -- dune build @install
 
       - name: Check the installed CLI
-        run: opam exec -- mperf-stat --help
+        run: opam exec -- mperf --help

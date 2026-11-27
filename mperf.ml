@@ -1,10 +1,10 @@
-(* apple_perf_stat.ml
+(* mperf.ml
    
-   OCaml wrapper for apple-perf-stat CLI tool.
+   OCaml wrapper for mperf CLI tool.
    Designed for integration with OCaml benchmarking services.
    
    Usage:
-     let result = Apple_perf_stat.run 
+     let result = Mperf.run 
        ~events:["cycles"; "instructions"; "l1d-tlb-misses"]
        ["./my_benchmark"; "--size"; "1000"]
      in
@@ -40,10 +40,10 @@ type error =
   | No_samples of string
   | Unknown of string
 
-(* mperf-stat on PATH, as opam installs it; else where a setuid install puts
+(* mperf on PATH, as opam installs it; else where a setuid install puts
    it. sudo resets PATH, hence the fallback. *)
 let default_tool_path () =
-  let in_dir d = Filename.concat d "mperf-stat" in
+  let in_dir d = Filename.concat d "mperf" in
   let dirs =
     match Sys.getenv_opt "PATH" with
     | Some p -> String.split_on_char ':' p
@@ -51,7 +51,7 @@ let default_tool_path () =
   in
   match List.find_opt (fun d -> d <> "" && Sys.file_exists (in_dir d)) dirs with
   | Some d -> in_dir d
-  | None -> "/usr/local/bin/mperf-stat"
+  | None -> "/usr/local/bin/mperf"
 
 let tool_path = ref (default_tool_path ())
 

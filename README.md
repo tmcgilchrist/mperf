@@ -15,10 +15,10 @@ Linux `perf stat` uses exact hardware counting when the number of requested even
 The kpc (kernel performance counters) APIs used by this tool require root privileges. This is enforced by XNU (the macOS kernel) via the `kpc_force_all_ctrs_set` sysctl.
 
 ```
-$ ./mperf-stat -e cycles -- echo hello
+$ ./mperf -e cycles -- echo hello
 Error: Root privileges required (run with sudo)
 
-$ sudo ./mperf-stat -e cycles -- echo hello
+$ sudo ./mperf -e cycles -- echo hello
 hello
 
  Performance counter stats for 'echo hello':
@@ -33,7 +33,7 @@ Note that only the PMU needs root: the measured command, and files opened for `-
 ```bash
 dune build
 sudo install -d /usr/local/bin
-sudo install -o root -g wheel -m 4755 _build/default/bin/mperf-stat /usr/local/bin/
+sudo install -o root -g wheel -m 4755 _build/default/bin/mperf /usr/local/bin/
 ```
 
 Redo the install after each rebuild. A setuid install only lets `-p` attach to your own processes.
@@ -60,12 +60,12 @@ Every run resets system-wide kdebug/kperf state, ending any other tracing sessio
 ## Building
 
 ```bash
-# Build mperf-stat and the OCaml library, and run the tests.
-# This also leaves a copy at ./mperf-stat, used in the examples below.
+# Build mperf and the OCaml library, and run the tests.
+# This also leaves a copy at ./mperf, used in the examples below.
 dune build
 dune test
 
-# Or install mperf-stat into your opam switch. --working-dir builds
+# Or install mperf into your opam switch. --working-dir builds
 # uncommitted changes too; without it opam builds the last commit.
 opam install . --with-test --working-dir
 ```
@@ -76,31 +76,31 @@ opam install . --with-test --working-dir
 
 ```bash
 # Basic usage (defaults to cycles + instructions)
-sudo ./mperf-stat -- ./my_benchmark
+sudo ./mperf -- ./my_benchmark
 
 # Specify events (repeated -e, or a comma-separated list, as perf stat allows)
-sudo ./mperf-stat -e cycles -e instructions -e l1d-tlb-misses -- ./benchmark
-sudo ./mperf-stat -e cycles,instructions,l1d-tlb-misses -- ./benchmark
+sudo ./mperf -e cycles -e instructions -e l1d-tlb-misses -- ./benchmark
+sudo ./mperf -e cycles,instructions,l1d-tlb-misses -- ./benchmark
 
 # JSON output (for scripting/parsing)
-sudo ./mperf-stat -j -e cycles -e instructions -- ./benchmark
+sudo ./mperf -j -e cycles -e instructions -- ./benchmark
 
 # List available events
-./mperf-stat -l
+./mperf -l
 
 # Count a running process until it exits
-sudo ./mperf-stat -p 1234
+sudo ./mperf -p 1234
 
 # Armed attach for harnesses, as with perf stat: write "enable" to ctl,
 # mperf answers "ack" on ack once counting
-sudo ./mperf-stat -p 1234 --delay -1 --control fifo:ctl,ack
+sudo ./mperf -p 1234 --delay -1 --control fifo:ctl,ack
 ```
 
 As with `perf stat -p`, an attached run has no user/sys lines and exits 0. A launched command under `--delay -1` is held until counting starts.
 
 Control commands are read and acknowledged as perf does, before and during counting. `disable` ends the counted window for good, since PET cannot be paused: a later `enable` is acknowledged but changes nothing. After `disable` the elapsed time covers the counted window, but user and sys time still cover the whole command.
 
-If you installed with `opam install`, run `sudo "$(which mperf-stat)"` in place of `sudo ./mperf-stat`, because `sudo` doesn't search your opam switch's `bin` directory.
+If you installed with `opam install`, run `sudo "$(which mperf)"` in place of `sudo ./mperf`, because `sudo` doesn't search your opam switch's `bin` directory.
 
 ### Example Output
 
@@ -155,10 +155,10 @@ metrics, matching perf 7.0 with `-e`.
 
 ### OCaml Library
 
-An OCaml wrapper is provided for future integration with OCaml benchmarking tooling.
+An OCaml wrapper is provided for future integration with OCaml benchmarking tooling. The opam package and library are `macperf` (`(libraries macperf)` in dune), and the module is `Mperf`.
 
 ```ocaml
-open Apple_perf_stat
+open Mperf
 
 let () =
   (* Must run as root *)
@@ -231,7 +231,7 @@ You can also use raw event names from the PMC database. The database files are a
 | M4                | `as4.plist`                 |
 | Intel             | `cpu_*.plist` (varies by model) |
 
-Run `./mperf-stat -l` to see all events for your CPU.
+Run `./mperf -l` to see all events for your CPU.
 
 ## How It Works: PET (Profile Every Thread)
 
@@ -257,13 +257,13 @@ Result = Σ (thread_last - thread_first) for all threads
 
 ```bash
 # Default: 1ms period - good balance
-sudo ./mperf-stat -e cycles -e instructions -- ./benchmark
+sudo ./mperf -e cycles -e instructions -- ./benchmark
 
 # Faster sampling (0.5ms) - more accurate for short-lived threads
-sudo ./mperf-stat -P 0.5 -e cycles -e instructions -- ./short_benchmark
+sudo ./mperf -P 0.5 -e cycles -e instructions -- ./short_benchmark
 
 # Slower sampling (5ms) - less overhead for long-running programs
-sudo ./mperf-stat -P 5 -e cycles -e instructions -- ./long_benchmark
+sudo ./mperf -P 5 -e cycles -e instructions -- ./long_benchmark
 ```
 
 - **Faster sampling:** More accurate (catches short-lived threads) but higher overhead
@@ -293,7 +293,7 @@ The number of hardware counters varies by architecture:
 
 Software and tool events don't count toward this, up to 16 events in all.
 
-Run `./mperf-stat -l` to see the counter counts for your CPU.
+Run `./mperf -l` to see the counter counts for your CPU.
 
 ### Sampling Accuracy
 
@@ -313,9 +313,9 @@ The tool tracks up to 256 unique threads. For programs with more threads, some d
 
 ## Comparison with Linux perf stat
 
-| Feature        | perf stat (Linux)                          | mperf-stat (macOS)                        |
+| Feature        | perf stat (Linux)                          | mperf (macOS)                        |
 |----------------|--------------------------------------------|-------------------------------------------|
-| Invocation     | `perf stat -e events -- cmd`               | `sudo mperf-stat -e events -- cmd`, or without sudo once setuid |
+| Invocation     | `perf stat -e events -- cmd`               | `sudo mperf -e events -- cmd`, or without sudo once setuid |
 | Counting       | Exact when within HW counter limit; scaled estimates when multiplexing | Sampling-based (PET), all counters always active |
 | Root required  | Some events                                | All events                                |
 | Output formats | Text, JSON, CSV                            | Text, JSON                                |

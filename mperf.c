@@ -1,5 +1,5 @@
 /*
- * apple-perf-stat: A perf stat-like tool for macOS (Apple Silicon and Intel)
+ * mperf: A perf stat-like tool for macOS (Apple Silicon and Intel)
  *
  * Uses PET (Profile Every Thread) for accurate per-process counter totals.
  * Correctly handles multi-threaded programs like OCaml 5.x with multiple

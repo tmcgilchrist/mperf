@@ -1,6 +1,6 @@
 (** Apple Performance Counters interface for macOS
 
-    This module provides a wrapper around the apple-perf-stat CLI tool,
+    This module provides a wrapper around the mperf CLI tool,
     giving OCaml programs access to hardware performance counters on
     macOS (Apple Silicon and Intel).
 
@@ -10,23 +10,23 @@
 
     {b Requirements:}
     - macOS (Apple Silicon or Intel)
-    - The apple-perf-stat binary installed
+    - The mperf binary installed
     - Root privileges (sudo)
 
     {b Example:}
     {[
       let () =
-        match Apple_perf_stat.run
+        match Mperf.run
           ~events:["cycles"; "instructions"; "l1d-tlb-misses"]
           ~sample_period_ms:1.0
           ["./benchmark"; "--iterations"; "1000"]
         with
         | Ok m ->
-          Printf.printf "IPC: %.2f\n" (Apple_perf_stat.get_ipc m);
+          Printf.printf "IPC: %.2f\n" (Mperf.get_ipc m);
           Printf.printf "Wall time: %.3f s\n"
-            (Apple_perf_stat.wall_time_seconds m)
+            (Mperf.wall_time_seconds m)
         | Error e ->
-          Printf.eprintf "Error: %s\n" (Apple_perf_stat.string_of_error e)
+          Printf.eprintf "Error: %s\n" (Mperf.string_of_error e)
     ]}
 *)
 
@@ -59,7 +59,7 @@ type measurement = {
 (** Possible errors *)
 type error =
   | Not_root              (** Not running as root *)
-  | Tool_not_found        (** apple-perf-stat binary not found *)
+  | Tool_not_found        (** mperf binary not found *)
   | Parse_error of string (** Failed to parse tool output *)
   | Command_failed of int (** Measured command failed *)
   | No_samples of string  (** No thread samples collected (program too short?) *)
@@ -67,8 +67,8 @@ type error =
 
 (** {1 Configuration} *)
 
-(** Set the path to the mperf-stat binary. The default is the first
-    [mperf-stat] on [PATH], else [/usr/local/bin/mperf-stat]. *)
+(** Set the path to the mperf binary. The default is the first
+    [mperf] on [PATH], else [/usr/local/bin/mperf]. *)
 val set_tool_path : string -> unit
 
 (** {1 Running measurements} *)
@@ -88,7 +88,7 @@ val set_tool_path : string -> unit
     {b Note:} Requires root privileges.
 
     {b Multi-threading:} For OCaml 5.x programs with N domains, expect
-    [mperf-stat -v] to report about 2*N threads (each domain has 2 pthreads). *)
+    [mperf -v] to report about 2*N threads (each domain has 2 pthreads). *)
 val run : ?events:string list -> ?sample_period_ms:float -> string list -> (measurement, error) result
 
 (** {1 Accessing results} *)
@@ -133,11 +133,11 @@ val string_of_error : error -> string
     {2 Raw Event Names}
 
     You can also use raw event names from the PMC database.
-    Run [apple-perf-stat --list] to see all available events
+    Run [mperf --list] to see all available events
     for your specific CPU.
 
     The event database files are located at [/usr/share/kpep/].
-    Run [mperf-stat --list] to see all events for your CPU.
+    Run [mperf --list] to see all events for your CPU.
 
     {1:threading Threading Model}
 
@@ -150,6 +150,6 @@ val string_of_error : error -> string
 
     For OCaml 5.x programs:
     - Each domain has 2 pthreads (domain thread + backup for systhreads)
-    - [mperf-stat -v] shows ~8 threads for a 4-domain program
+    - [mperf -v] shows ~8 threads for a 4-domain program
     - Counter values represent total work across all domains
 *)
