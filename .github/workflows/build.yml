@@ -22,16 +22,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Build C tool
-        run: make
-
-      - name: Set up OCaml 5.3
+      - name: Set up OCaml 5.5
         uses: ocaml/setup-ocaml@v3
         with:
-          ocaml-compiler: "5.3"
+          ocaml-compiler: "5.5"
 
-      - name: Install opam dependencies
-        run: opam install . --deps-only
+      - name: Install with opam, running the tests
+        run: opam install . --with-test
 
-      - name: Build OCaml library
-        run: opam exec -- dune build
+      # opam hides a successful build's output; this shows clang's warnings.
+      - name: Build, showing C compiler warnings
+        run: opam exec -- dune build @install
+
+      - name: Check the installed CLI
+        run: opam exec -- mperf-stat --help

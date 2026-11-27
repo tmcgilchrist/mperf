@@ -40,7 +40,20 @@ type error =
   | No_samples of string
   | Unknown of string
 
-let tool_path = ref "/usr/local/bin/apple-perf-stat"
+(* mperf-stat on PATH, as opam installs it; else where a setuid install puts
+   it. sudo resets PATH, hence the fallback. *)
+let default_tool_path () =
+  let in_dir d = Filename.concat d "mperf-stat" in
+  let dirs =
+    match Sys.getenv_opt "PATH" with
+    | Some p -> String.split_on_char ':' p
+    | None -> []
+  in
+  match List.find_opt (fun d -> d <> "" && Sys.file_exists (in_dir d)) dirs with
+  | Some d -> in_dir d
+  | None -> "/usr/local/bin/mperf-stat"
+
+let tool_path = ref (default_tool_path ())
 
 let set_tool_path path = tool_path := path
 

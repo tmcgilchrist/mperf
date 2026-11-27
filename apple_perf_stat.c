@@ -905,9 +905,12 @@ typedef enum {
 } control_cmd_t;
 
 // A descriptor number given as fd:N must name a descriptor mperf inherited.
-static bool parse_control_fd(const char *s, int *fd) {
+static bool parse_control_fd(const char *s, const char *spec, int *fd) {
     unsigned long v;
-    if (!parse_id(s, &v) || v > INT_MAX) return false;
+    if (!parse_id(s, &v) || v > INT_MAX) {
+        fprintf(stderr, "Error: bad --control fd spec: %s\n", spec);
+        return false;
+    }
     if (fcntl((int)v, F_GETFD) == -1) {
         fprintf(stderr, "Error: --control fd %lu is not open\n", v);
         return false;
@@ -931,9 +934,8 @@ static bool parse_control(const char *spec, control_t *c) {
         ok = c->ctl_fd >= 0 && (!ack || c->ack_fd >= 0);
         if (!ok) fprintf(stderr, "Error: cannot open --control fifo: %s\n", strerror(errno));
     } else if (strncmp(copy, "fd:", 3) == 0) {
-        ok = parse_control_fd(copy + 3, &c->ctl_fd) &&
-             (!ack || parse_control_fd(ack, &c->ack_fd));
-        if (!ok) fprintf(stderr, "Error: bad --control fd spec: %s\n", spec);
+        ok = parse_control_fd(copy + 3, spec, &c->ctl_fd) &&
+             (!ack || parse_control_fd(ack, spec, &c->ack_fd));
     } else {
         fprintf(stderr, "Error: --control takes fifo:CTL[,ACK] or fd:CTL[,ACK]\n");
     }
@@ -1918,20 +1920,24 @@ int main(int argc, char **argv) {
             case OPT_APPEND:
                 append = true;
                 break;
-            case OPT_LOG_FD:
-                output_fd = atoi(optarg);
-                if (output_fd < 0) {
+            case OPT_LOG_FD: {
+                unsigned long fd;
+                if (!parse_id(optarg, &fd) || fd > INT_MAX) {
                     fprintf(stderr, "Invalid --log-fd: %s\n", optarg);
                     return 1;
                 }
+                output_fd = (int)fd;
                 break;
-            case 'P':
-                sample_period_ms = atof(optarg);
-                if (sample_period_ms <= 0) {
+            }
+            case 'P': {
+                char *end;
+                sample_period_ms = strtod(optarg, &end);
+                if (end == optarg || *end || !(sample_period_ms > 0)) {
                     fprintf(stderr, "Invalid sample period\n");
                     return 1;
                 }
                 break;
+            }
             case 'p': {
                 unsigned long pid;
                 if (!parse_id(optarg, &pid) || pid == 0 || pid > INT32_MAX) {

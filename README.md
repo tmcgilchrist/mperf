@@ -31,19 +31,14 @@ Note that only the PMU needs root: the measured command, and files opened for `-
 ### Running without sudo
 
 ```bash
-sudo make install
-sudo chown root:wheel /usr/local/bin/mperf-stat
-sudo chmod u+s /usr/local/bin/mperf-stat
+dune build
+sudo install -d /usr/local/bin
+sudo install -o root -g wheel -m 4755 _build/default/bin/mperf-stat /usr/local/bin/
 ```
 
-Redo the last two steps after each rebuild. A setuid install only lets `-p` attach to your own processes.
+Redo the install after each rebuild. A setuid install only lets `-p` attach to your own processes.
 
-Every run resets system-wide kdebug/kperf state, ending any other tracing session (`fs_usage`, Instruments). To restrict a setuid install to admins:
-
-```bash
-sudo chown root:admin /usr/local/bin/mperf-stat
-sudo chmod 4750 /usr/local/bin/mperf-stat
-```
+Every run resets system-wide kdebug/kperf state, ending any other tracing session (`fs_usage`, Instruments). To restrict a setuid install to admins, use `-g admin -m 4750` instead.
 
 ### What's NOT Required
 
@@ -65,14 +60,14 @@ sudo chmod 4750 /usr/local/bin/mperf-stat
 ## Building
 
 ```bash
-# Build the C tool
-make
-
-# Install to /usr/local/bin
-sudo make install
-
-# Build OCaml library
+# Build mperf-stat and the OCaml library, and run the tests.
+# This also leaves a copy at ./mperf-stat, used in the examples below.
 dune build
+dune test
+
+# Or install mperf-stat into your opam switch. --working-dir builds
+# uncommitted changes too; without it opam builds the last commit.
+opam install . --with-test --working-dir
 ```
 
 ## Usage
@@ -104,6 +99,8 @@ sudo ./mperf-stat -p 1234 --delay -1 --control fifo:ctl,ack
 As with `perf stat -p`, an attached run has no user/sys lines and exits 0. A launched command under `--delay -1` is held until counting starts.
 
 Control commands are read and acknowledged as perf does, before and during counting. `disable` ends the counted window for good, since PET cannot be paused: a later `enable` is acknowledged but changes nothing. After `disable` the elapsed time covers the counted window, but user and sys time still cover the whole command.
+
+If you installed with `opam install`, run `sudo "$(which mperf-stat)"` in place of `sudo ./mperf-stat`, because `sudo` doesn't search your opam switch's `bin` directory.
 
 ### Example Output
 
