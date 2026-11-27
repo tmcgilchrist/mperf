@@ -67,8 +67,8 @@ type error =
 
 (** {1 Configuration} *)
 
-(** Set the path to the apple-perf-stat binary.
-    Default is [/usr/local/bin/apple-perf-stat] *)
+(** Set the path to the mperf-stat binary. The default is the first
+    [mperf-stat] on [PATH], else [/usr/local/bin/mperf-stat]. *)
 val set_tool_path : string -> unit
 
 (** {1 Running measurements} *)

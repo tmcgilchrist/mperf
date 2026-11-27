@@ -211,9 +211,8 @@ Only perf's --delay -1 is supported, and it goes with --control.
   Error: bad --control fd spec: fd:4294967299
   [1]
 
-  $ mperf-stat --delay -1 --control fd:250 -- true
-  Error: --control fd 250 is not open
-  Error: bad --control fd spec: fd:250
+  $ mperf-stat --delay -1 --control fd:2147483647 -- true
+  Error: --control fd 2147483647 is not open
   [1]
 
 The PET sampling period must be a positive number of milliseconds.
@@ -230,10 +229,18 @@ The PET sampling period must be a positive number of milliseconds.
   Invalid sample period
   [1]
 
---log-fd must not be negative.
+  $ mperf-stat -P 1abc -- true
+  Invalid sample period
+  [1]
+
+--log-fd must be a descriptor number.
 
   $ mperf-stat --log-fd -1 -- true
   Invalid --log-fd: -1
+  [1]
+
+  $ mperf-stat --log-fd abc -- true
+  Invalid --log-fd: abc
   [1]
 
 The report can go to a file or to a descriptor, not both. This is checked

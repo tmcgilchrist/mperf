@@ -32,6 +32,7 @@ Note that only the PMU needs root: the measured command, and files opened for `-
 
 ```bash
 dune build
+sudo install -d /usr/local/bin
 sudo install -o root -g wheel -m 4755 _build/default/bin/mperf-stat /usr/local/bin/
 ```
 
@@ -64,8 +65,9 @@ Every run resets system-wide kdebug/kperf state, ending any other tracing sessio
 dune build
 dune test
 
-# Or install mperf-stat into your opam switch
-opam install . --with-test
+# Or install mperf-stat into your opam switch. --working-dir builds
+# uncommitted changes too; without it opam builds the last commit.
+opam install . --with-test --working-dir
 ```
 
 ## Usage
