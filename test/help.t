@@ -22,6 +22,8 @@ and -h print it and exit 0.
                          perf stat's control channel: "enable" starts
                          counting, answered with "ack" once it has;
                          "disable" ends it
+    -i, --no-inherit     Count only the process itself, not its children
+                         (always so; --inherit is accepted with a warning)
     -v, --verbose        Verbose output
     -l, --list           List available events
     -h, --help           Show this help
@@ -82,6 +84,8 @@ and fail.
                          perf stat's control channel: "enable" starts
                          counting, answered with "ack" once it has;
                          "disable" ends it
+    -i, --no-inherit     Count only the process itself, not its children
+                         (always so; --inherit is accepted with a warning)
     -v, --verbose        Verbose output
     -l, --list           List available events
     -h, --help           Show this help
@@ -136,6 +140,8 @@ and fail.
                          perf stat's control channel: "enable" starts
                          counting, answered with "ack" once it has;
                          "disable" ends it
+    -i, --no-inherit     Count only the process itself, not its children
+                         (always so; --inherit is accepted with a warning)
     -v, --verbose        Verbose output
     -l, --list           List available events
     -h, --help           Show this help

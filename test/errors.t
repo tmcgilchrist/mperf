@@ -26,6 +26,8 @@ platform's libc), then the usage text.
                          perf stat's control channel: "enable" starts
                          counting, answered with "ack" once it has;
                          "disable" ends it
+    -i, --no-inherit     Count only the process itself, not its children
+                         (always so; --inherit is accepted with a warning)
     -v, --verbose        Verbose output
     -l, --list           List available events
     -h, --help           Show this help
@@ -80,6 +82,8 @@ platform's libc), then the usage text.
                          perf stat's control channel: "enable" starts
                          counting, answered with "ack" once it has;
                          "disable" ends it
+    -i, --no-inherit     Count only the process itself, not its children
+                         (always so; --inherit is accepted with a warning)
     -v, --verbose        Verbose output
     -l, --list           List available events
     -h, --help           Show this help
@@ -134,6 +138,8 @@ platform's libc), then the usage text.
                          perf stat's control channel: "enable" starts
                          counting, answered with "ack" once it has;
                          "disable" ends it
+    -i, --no-inherit     Count only the process itself, not its children
+                         (always so; --inherit is accepted with a warning)
     -v, --verbose        Verbose output
     -l, --list           List available events
     -h, --help           Show this help
@@ -213,6 +219,18 @@ Only perf's --delay -1 is supported, and it goes with --control.
 
   $ mperf --delay -1 --control fd:2147483647 -- true
   Error: --control fd 2147483647 is not open
+  [1]
+
+--inherit is accepted, as perf takes it, but mperf never counts children, and
+says so. -i/--no-inherit is what it always does.
+
+  $ mperf --inherit -p 123 -- true
+  Warning: --inherit: mperf counts only the process itself, not the children it forks
+  Error: give either -p PID or a command, not both
+  [1]
+
+  $ mperf -i --no-inherit -p 123 -- true
+  Error: give either -p PID or a command, not both
   [1]
 
 The PET sampling period must be a positive number of milliseconds.

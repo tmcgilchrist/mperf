@@ -324,6 +324,7 @@ The tool tracks up to 256 unique threads. For programs with more threads, some d
 | Report stream  | stderr; `-o`, `--append`, `--log-fd`       | Same                                      |
 | Exit status    | Command's exit code, or 128 + signal       | Same                                      |
 | Attach         | `-p PID`                                   | Same                                      |
+| Child processes| Counted (`--inherit`, the default)         | Not counted; `--inherit` is accepted with a warning |
 | Armed start    | `--delay -1 --control fifo:\|fd:`         | Same; one `enable`/`disable` window      |
 | HW counters    | 4-8 GP + 3-4 fixed (varies by CPU)        | Varies: 2-3 fixed + 4-8 configurable      |
 | Multiplexing   | Yes, with time-scaled estimates            | No (hard limit of 10 events)              |
