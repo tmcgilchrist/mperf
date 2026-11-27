@@ -1775,6 +1775,8 @@ static void usage(const char *prog) {
         "                       perf stat's control channel: \"enable\" starts\n"
         "                       counting, answered with \"ack\" once it has;\n"
         "                       \"disable\" ends it\n"
+        "  -i, --no-inherit     Count only the process itself, not its children\n"
+        "                       (always so; --inherit is accepted with a warning)\n"
         "  -v, --verbose        Verbose output\n"
         "  -l, --list           List available events\n"
         "  -h, --help           Show this help\n"
@@ -1874,7 +1876,7 @@ int main(int argc, char **argv) {
 
     // Short flags follow perf stat where an equivalent exists. In particular
     // -p is perf's --pid, so the PET sampling period lives on -P/--period.
-    enum { OPT_APPEND = 1000, OPT_LOG_FD, OPT_CONTROL };
+    enum { OPT_APPEND = 1000, OPT_LOG_FD, OPT_CONTROL, OPT_INHERIT };
 
     static struct option long_opts[] = {
         {"event",   required_argument, 0, 'e'},
@@ -1886,6 +1888,8 @@ int main(int argc, char **argv) {
         {"pid",     required_argument, 0, 'p'},
         {"delay",   required_argument, 0, 'D'},
         {"control", required_argument, 0, OPT_CONTROL},
+        {"inherit", no_argument,       0, OPT_INHERIT},
+        {"no-inherit", no_argument,    0, 'i'},
         {"verbose", no_argument,       0, 'v'},
         {"list",    no_argument,       0, 'l'},
         {"help",    no_argument,       0, 'h'},
@@ -1905,7 +1909,7 @@ int main(int argc, char **argv) {
     const char *control_spec = NULL;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "e:jo:P:p:D:vlh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "e:jo:P:p:D:ivlh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'e':
                 if (!add_event_list(optarg, events, &event_count))
@@ -1959,6 +1963,15 @@ int main(int argc, char **argv) {
             case OPT_CONTROL:
                 control_spec = optarg;
                 break;
+            // perf counts child processes by default, and harnesses pass
+            // --inherit to be sure. kperf's PID filter sees only the process
+            // itself, so accept the flag rather than fail, and say so.
+            case OPT_INHERIT:
+                fprintf(stderr, "Warning: --inherit: mperf counts only the process "
+                                "itself, not the children it forks\n");
+                break;
+            case 'i':
+                break;  // what mperf always does
             case 'v':
                 verbose = true;
                 break;
